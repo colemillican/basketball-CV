@@ -1,0 +1,106 @@
+video:
+  source: 0
+  width: 1280
+  height: 720
+  rim_source: 0
+  rim_width: 1280
+  rim_height: 720
+  wide_source: 1
+  wide_width: 1280
+  wide_height: 720
+
+detector:
+  backend: yolo
+  model_path: yolov8n.pt
+  confidence: 0.25
+  ball_class_ids: [32]
+  max_detections: 3
+
+tracking:
+  max_distance_px: 80
+  max_missed_frames: 20
+
+shot_logic:
+  rim_radius_px: 42
+  score_cooldown_frames: 15
+  make_confirm_frames: 3
+  miss_timeout_frames: 55
+  min_shot_arc_drop_px: 28
+  entry_above_margin_px: 8
+  net_drop_margin_px: 14
+  net_lane_radius_scale: 0.8
+  net_confirm_frames: 2
+
+  # --- Confidence scoring ---
+  # Set use_confidence_scoring: false to fall back to the original AND logic.
+  use_confidence_scoring: true
+  make_threshold: 60       # score >= threshold → make  (max possible ~95)
+  net_flow_threshold: 1.5  # mean optical flow magnitude in net ROI to trigger net signal
+  min_tracking_frames: 10  # gate: frames ball must be tracked before a shot is counted
+  min_travel_px: 150.0     # gate: pixels ball must travel before scoring zone entry
+  weights:
+    above_rim_entry:  20   # ball was seen above the rim plane
+    inside_rim_zone:  20   # ball sustained inside scoring zone (baseline signal)
+    net_lane_passage: 35   # ball passed downward through net lane (strongest make signal)
+    net_optical_flow: 20   # motion detected in net ROI via optical flow
+    bounce_away:     -50   # ball moved away from rim after scoring zone entry
+
+calibration:
+  court_width_ft: 50.0
+  court_length_ft: 94.0
+
+runtime_calibration:
+  rim_center_px: [640, 250]
+  court_image_points:
+    - [180, 640]
+    - [1100, 640]
+    - [820, 300]
+    - [460, 300]
+  wide_court_image_points:
+    - [180, 640]
+    - [1100, 640]
+    - [820, 300]
+    - [460, 300]
+
+ui:
+  player_store_path: output/players.json
+  idle_timeout_sec: 600
+  modes:
+    - name: "Spot Up"
+      end_trigger: "manual"
+    - name: "Catch and Shoot"
+      end_trigger: "timer"
+      timer_sec: 300
+    - name: "Game Shots"
+      end_trigger: "manual"
+
+runtime:
+  backend: mock
+  mock:
+    shot_interval_sec: 2.2
+    make_probability: 0.62
+    location_jitter_ft: 2.0
+    shot_zones_ft:
+      - [25.0, 8.0]
+      - [15.0, 18.0]
+      - [35.0, 18.0]
+      - [8.0, 22.0]
+      - [42.0, 22.0]
+      - [5.0, 6.0]
+      - [45.0, 6.0]
+      - [25.0, 28.0]
+  dual_benchmark:
+    duration_sec: 30
+    report_interval_sec: 1.0
+    rim_stride: 1
+    wide_stride: 2
+    use_detection: true
+
+debug:
+  show_overlay: true
+
+output:
+  session_dir: output
+  shots_csv: shots.csv
+  chart_png: shot_chart.png
+  summary_json: summary.json

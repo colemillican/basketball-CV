@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Basketball Trainer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="scanlines"></div>
+
+  <main class="app">
+
+    <!-- ═══════════════════════════════════════════
+         SCREEN 1: PLAYER SELECT
+    ═══════════════════════════════════════════ -->
+    <section id="screen-player-select" class="screen active">
+      <div class="screen-header">
+        <div class="logo-mark">B</div>
+        <h1 class="screen-title">SELECT PLAYER</h1>
+        <p class="screen-sub">Use D-PAD to navigate · A to select</p>
+      </div>
+      <div class="list-container">
+        <ul id="player-list" class="nav-list" role="listbox"></ul>
+        <button id="btn-add-player" class="nav-item add-item" data-nav-index="-1">
+          <span class="add-icon">+</span>
+          <span>Add New Player</span>
+        </button>
+      </div>
+      <div class="screen-hint">
+        <kbd>D-PAD</kbd> Navigate &nbsp;&nbsp; <kbd>A</kbd> Select
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════
+         SCREEN 2: ADD PLAYER (virtual keyboard)
+    ═══════════════════════════════════════════ -->
+    <section id="screen-add-player" class="screen">
+      <div class="screen-header">
+        <h1 class="screen-title">NEW PLAYER</h1>
+        <p class="screen-sub">Enter your name</p>
+      </div>
+      <div class="kb-display" id="kb-display">_</div>
+      <div id="keyboard" class="keyboard"></div>
+      <div class="screen-hint">
+        <kbd>D-PAD</kbd> Navigate &nbsp;&nbsp; <kbd>A</kbd> Select Letter &nbsp;&nbsp; <kbd>B</kbd> Delete &nbsp;&nbsp; <kbd>START</kbd> Confirm
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════
+         SCREEN 3: MODE SELECT
+    ═══════════════════════════════════════════ -->
+    <section id="screen-mode-select" class="screen">
+      <div class="screen-header">
+        <div class="player-badge" id="mode-player-badge"></div>
+        <h1 class="screen-title">SELECT MODE</h1>
+      </div>
+      <div class="player-career-bar" id="player-career-bar"></div>
+      <div class="list-container">
+        <ul id="mode-list" class="nav-list" role="listbox"></ul>
+      </div>
+      <button id="btn-view-profile" class="mode-profile-btn" data-nav-index="-1">VIEW PROFILE</button>
+      <div class="screen-hint">
+        <kbd>D-PAD</kbd> Navigate &nbsp;&nbsp; <kbd>A</kbd> Start / Open &nbsp;&nbsp; <kbd>B</kbd> Back
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════
+         SCREEN 4: LIVE SESSION
+    ═══════════════════════════════════════════ -->
+    <section id="screen-profile" class="screen">
+      <div class="profile-simple">
+        <div class="screen-header">
+          <div class="player-badge" id="profile-player-badge"></div>
+          <h1 class="screen-title">PLAYER PROFILE</h1>
+          <p class="screen-sub" id="profile-created-at"></p>
+        </div>
+
+        <div class="profile-card">
+          <div class="chart-title">ACCOUNT</div>
+          <div class="profile-row"><strong>Name:</strong> <span id="profile-name-value"></span></div>
+        </div>
+
+        <div class="profile-stats-grid">
+          <div class="summary-stat">
+            <div class="summary-val accent-color" id="profile-total-shots">0</div>
+            <div class="summary-lbl">CAREER SHOTS</div>
+          </div>
+          <div class="summary-stat">
+            <div class="summary-val make-color" id="profile-total-makes">0</div>
+            <div class="summary-lbl">CAREER MAKES</div>
+          </div>
+          <div class="summary-stat">
+            <div class="summary-val accent-color" id="profile-fg">0.0%</div>
+            <div class="summary-lbl">CAREER FG%</div>
+          </div>
+        </div>
+
+        <ul id="profile-menu" class="nav-list"></ul>
+        <div class="screen-hint">
+          <kbd>D-PAD</kbd> Navigate &nbsp;&nbsp; <kbd>A</kbd> Select &nbsp;&nbsp; <kbd>B</kbd> Back
+        </div>
+      </div>
+    </section>
+
+    <section id="screen-history" class="screen">
+      <div class="history-layout">
+        <div class="history-left">
+          <div class="screen-header">
+            <div class="player-badge" id="history-player-badge"></div>
+            <h1 class="screen-title">SESSION HISTORY</h1>
+            <p class="screen-sub">Use LEFT/RIGHT to change filter</p>
+          </div>
+
+          <div class="profile-card">
+            <div class="chart-title">FILTER</div>
+            <div class="profile-row" id="history-filter-label">ALL SESSIONS</div>
+          </div>
+
+          <ul id="history-list" class="nav-list"></ul>
+          <div class="screen-hint">
+            <kbd>D-PAD</kbd> Navigate &nbsp;&nbsp; <kbd>LEFT/RIGHT</kbd> Filter &nbsp;&nbsp; <kbd>A</kbd> Select &nbsp;&nbsp; <kbd>B</kbd> Back
+          </div>
+        </div>
+
+        <div class="history-right">
+          <div class="chart-title">SESSION DETAIL</div>
+          <div class="history-detail-card">
+            <div class="profile-row" id="history-detail-primary">Select a session</div>
+            <div class="profile-row subtle" id="history-detail-secondary">Mode, date, and shooting summary appear here.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="screen-live" class="screen">
+      <div class="live-layout">
+
+        <!-- Left: Stats panel -->
+        <div class="live-stats-panel">
+          <div class="live-stats-content">
+            <div class="live-header">
+              <span id="live-player-name" class="live-player"></span>
+              <span class="live-sep">·</span>
+              <span id="live-mode-name" class="live-mode"></span>
+            </div>
+
+            <div class="stat-block">
+              <div class="stat-item">
+                <div class="stat-value make-color" id="live-makes">0</div>
+                <div class="stat-label">MAKES</div>
+              </div>
+              <div class="stat-divider"></div>
+              <div class="stat-item">
+                <div class="stat-value miss-color" id="live-misses">0</div>
+                <div class="stat-label">MISSES</div>
+              </div>
+            </div>
+
+            <div class="fg-block">
+              <div class="fg-value" id="live-fg">0.0</div>
+              <div class="fg-label">FIELD GOAL %</div>
+              <div class="fg-bar-wrap">
+                <div class="fg-bar" id="live-fg-bar"></div>
+              </div>
+            </div>
+
+            <div class="last-shot-display" id="last-shot-display">
+              <div class="last-shot-label">LAST SHOT</div>
+              <div class="last-shot-result" id="last-shot-result">—</div>
+            </div>
+
+            <div class="timer-block" id="timer-block">
+              <div class="timer-value" id="live-timer">—</div>
+              <div class="timer-label">TIME</div>
+            </div>
+          </div>
+
+          <div class="live-stats-footer">
+            <button id="btn-end-session" class="end-btn">END SESSION</button>
+            <div class="end-hint"><kbd>START</kbd> · click to end session</div>
+          </div>
+        </div>
+
+        <!-- Right: Shot chart -->
+        <div class="live-chart-panel">
+          <div class="chart-title">SHOT CHART</div>
+          <div class="chart-wrap">
+            <svg id="shot-chart"
+                 viewBox="0 0 600 564"
+                 width="600" height="564"
+                 preserveAspectRatio="xMidYMid meet"
+                 xmlns="http://www.w3.org/2000/svg">
+            </svg>
+          </div>
+          <div class="chart-legend">
+            <span class="legend-dot make"></span> Make &nbsp;&nbsp;
+            <span class="legend-dot miss"></span> Miss
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Make/miss flash overlay -->
+      <div class="shot-flash" id="shot-flash"></div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════
+         SCREEN 5: SESSION SUMMARY
+    ═══════════════════════════════════════════ -->
+    <section id="screen-summary" class="screen">
+      <div class="summary-layout">
+
+        <div class="summary-left">
+          <div class="summary-header">
+            <div class="summary-tag">SESSION COMPLETE</div>
+            <div class="summary-player" id="summary-player"></div>
+            <div class="summary-meta" id="summary-meta"></div>
+          </div>
+
+          <ul id="summary-menu" class="nav-list summary-menu"></ul>
+          <div class="screen-hint">
+            <kbd>D-PAD</kbd> Navigate &nbsp;&nbsp; <kbd>A</kbd> Select &nbsp;&nbsp; <kbd>B</kbd> Play Again
+          </div>
+        </div>
+
+        <div class="summary-right">
+          <div class="chart-title">SESSION CHART</div>
+          <div class="summary-stats">
+            <div class="summary-stat">
+              <div class="summary-val make-color" id="sum-makes">0</div>
+              <div class="summary-lbl">MAKES</div>
+            </div>
+            <div class="summary-stat">
+              <div class="summary-val miss-color" id="sum-misses">0</div>
+              <div class="summary-lbl">MISSES</div>
+            </div>
+            <div class="summary-stat">
+              <div class="summary-val accent-color" id="sum-fg">0.0%</div>
+              <div class="summary-lbl">FG%</div>
+            </div>
+          </div>
+          <div class="chart-wrap summary-chart-wrap">
+            <svg id="summary-chart"
+                 viewBox="0 0 600 564"
+                 width="600" height="564"
+                 preserveAspectRatio="xMidYMid meet"
+                 xmlns="http://www.w3.org/2000/svg">
+            </svg>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <section id="screen-idle-leaderboard" class="screen">
+      <div class="screen-header">
+        <div class="logo-mark">B</div>
+        <h1 class="screen-title">LEADERBOARD</h1>
+        <p class="screen-sub">Top career makes · move or press any button to return</p>
+      </div>
+      <div class="list-container idle-board-wrap">
+        <ul id="idle-leaderboard-list" class="nav-list"></ul>
+      </div>
+      <div class="screen-hint">
+        <kbd>ANY INPUT</kbd> Return to start
+      </div>
+    </section>
+
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
