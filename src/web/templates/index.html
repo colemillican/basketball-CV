@@ -3,21 +3,81 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Basketball Trainer</title>
+  <title>Plainview Basketball</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <div class="scanlines"></div>
 
+  <!-- Fixed school brand — visible on all post-boot screens -->
+  <div id="school-brand" class="school-brand">PLAINVIEW BASKETBALL</div>
+
   <main class="app">
+
+    <!-- ═══════════════════════════════════════════
+         SCREEN 0: BOOT
+    ═══════════════════════════════════════════ -->
+    <section id="screen-boot" class="screen active">
+      <!-- Ambient glow -->
+      <div class="boot-ambient"></div>
+
+      <!-- Perimeter frame that traces itself clockwise -->
+      <div class="boot-frame">
+        <div class="boot-frame-top"></div>
+        <div class="boot-frame-right"></div>
+        <div class="boot-frame-bottom"></div>
+        <div class="boot-frame-left"></div>
+        <span class="boot-node boot-node--tl"></span>
+        <span class="boot-node boot-node--tr"></span>
+        <span class="boot-node boot-node--br"></span>
+        <span class="boot-node boot-node--bl"></span>
+      </div>
+
+      <div class="boot-center">
+
+        <!-- Single-line title -->
+        <div class="boot-title-clip">
+          <div class="boot-title">PLAINVIEW BASKETBALL</div>
+        </div>
+        <div class="boot-title-rule"></div>
+        <div class="boot-tagline">SHOT TRACKING &nbsp;&middot;&nbsp; PERFORMANCE ANALYTICS &nbsp;&middot;&nbsp; AI VISION</div>
+
+        <!-- Status readouts -->
+        <div class="boot-status-block">
+          <div class="boot-status-row" style="--si:0">
+            <span class="boot-sl">SYSTEM</span>
+            <span class="boot-sd"></span>
+            <span class="boot-sv">ONLINE</span>
+          </div>
+          <div class="boot-status-row" style="--si:1">
+            <span class="boot-sl">DETECTION ENGINE</span>
+            <span class="boot-sd"></span>
+            <span class="boot-sv">READY</span>
+          </div>
+          <div class="boot-status-row" style="--si:2">
+            <span class="boot-sl">PLAYER DATABASE</span>
+            <span class="boot-sd"></span>
+            <span class="boot-sv">LOADED</span>
+          </div>
+        </div>
+
+        <!-- Progress bar -->
+        <div class="boot-progress-wrap">
+          <div class="boot-progress-track"></div>
+          <div class="boot-progress-bar"></div>
+        </div>
+
+        <div class="boot-prompt" id="boot-prompt">PRESS ANY BUTTON TO CONTINUE</div>
+      </div>
+    </section>
 
     <!-- ═══════════════════════════════════════════
          SCREEN 1: PLAYER SELECT
     ═══════════════════════════════════════════ -->
-    <section id="screen-player-select" class="screen active">
+    <section id="screen-player-select" class="screen">
       <div class="screen-header">
         <div class="logo-mark">B</div>
         <h1 class="screen-title">SELECT PLAYER</h1>

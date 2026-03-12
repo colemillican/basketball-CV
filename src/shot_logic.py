@@ -57,6 +57,7 @@ class ShotLogic:
         net_flow_threshold: float = 1.5,
         min_tracking_frames: int = 10,
         min_travel_px: float = 150.0,
+        min_launch_velocity_px: float = 5.0,
         weights: Optional[Dict[str, float]] = None,
     ) -> None:
         self.rim_center = rim_center
@@ -75,6 +76,7 @@ class ShotLogic:
         self.net_flow_threshold = net_flow_threshold
         self.min_tracking_frames = min_tracking_frames
         self.min_travel_px = min_travel_px
+        self.min_launch_velocity_px = min_launch_velocity_px
 
         _default_weights: Dict[str, float] = {
             "above_rim_entry":  20.0,
@@ -204,8 +206,20 @@ class ShotLogic:
         if len(self.recent_positions) < 6:
             return
 
-        ys = [p[1] for p in self.recent_positions[-6:]]
+        positions = self.recent_positions[-6:]
+        ys = [p[1] for p in positions]
         arc_drop = ys[-1] - min(ys)
+
+        # Velocity gate: reject slow/stationary tracks (e.g. rim false positives)
+        if self.min_launch_velocity_px > 0:
+            vels = [
+                ((positions[i][0] - positions[i - 1][0]) ** 2
+                 + (positions[i][1] - positions[i - 1][1]) ** 2) ** 0.5
+                for i in range(1, len(positions))
+            ]
+            if sum(vels) / len(vels) < self.min_launch_velocity_px:
+                return
+
         if self._is_in_launch_region(ball_center) and arc_drop > self.min_shot_arc_drop_px:
             self.attempt_id += 1
             self.current = ShotAttempt(

@@ -81,7 +81,12 @@ class WorkoutRuntime:
         frame_count = 0
 
         try:
-            cam = Camera(self.cfg.video["source"], self.cfg.video["width"], self.cfg.video["height"])
+            cam = Camera(
+                self.cfg.video["source"],
+                self.cfg.video["width"],
+                self.cfg.video["height"],
+                fps=int(self.cfg.video.get("fps", 60)),
+            )
             detector = build_detector(self.cfg.raw.get("detector", {}))
             tracker = BallTracker(
                 max_distance_px=self.cfg.tracking["max_distance_px"],
@@ -102,6 +107,9 @@ class WorkoutRuntime:
                 )
 
             shot_logic = self._build_shot_logic(rim_center)
+            rim_radius_px = self.cfg.shot_logic.get("rim_radius_px", 42)
+            excl_scale = self.cfg.raw.get("detector", {}).get("rim_exclusion_scale", 1.5)
+            detector.set_rim(rim_center, int(rim_radius_px * excl_scale))
 
             mapper = CourtMapper(
                 court_width_ft=self.cfg.calibration["court_width_ft"],
@@ -124,6 +132,12 @@ class WorkoutRuntime:
             total = 0
             self._emit("status", running=True, makes=makes, total=total, fg_percent=0.0)
 
+            # Foot position captured at the moment each attempt is triggered.
+            # Using feet (floor-level) instead of ball release pixel eliminates
+            # the parallax error that makes shots appear closer than they are.
+            shot_start_foot_px: Optional[Tuple[int, int]] = None
+            prev_has_attempt = False
+
             while not self._stop_evt.is_set():
                 ok, frame = cam.read()
                 if not ok:
@@ -136,17 +150,27 @@ class WorkoutRuntime:
                 center = track.center if track is not None else None
 
                 done = shot_logic.update(center, frame)
+
+                # Capture foot position at the exact frame an attempt is triggered
+                has_attempt = shot_logic.current is not None
+                if has_attempt and not prev_has_attempt:
+                    feet = detector.detect_person_feet()
+                    shot_start_foot_px = feet[0] if feet else None
+                prev_has_attempt = has_attempt
+
                 if done is not None:
                     total += 1
                     if done.result == "make":
                         makes += 1
-                    court_xy = mapper.map_pixel_to_court(done.start_px)
+                    location_px = shot_start_foot_px if shot_start_foot_px is not None else done.start_px
+                    shot_start_foot_px = None
+                    court_xy = mapper.map_pixel_to_court(location_px)
                     store.add_shot(
                         shot_id=done.id,
                         frame_start=done.start_frame,
                         frame_end=done.end_frame,
                         result=done.result,
-                        start_px=done.start_px,
+                        start_px=location_px,
                         court_xy=court_xy,
                     )
                     fg = (makes / total * 100.0) if total else 0.0
@@ -154,7 +178,7 @@ class WorkoutRuntime:
                         "shot",
                         shot_id=done.id,
                         result=done.result,
-                        start_px=done.start_px,
+                        start_px=location_px,
                         court_xy=court_xy,
                         makes=makes,
                         total=total,
@@ -260,12 +284,13 @@ class WorkoutRuntime:
         finally:
             self._running = False
 
-    def _camera_settings(self, prefix: str) -> Tuple[int | str, int, int]:
+    def _camera_settings(self, prefix: str) -> Tuple[int | str, int, int, int]:
         v = self.cfg.video
         source = v.get(f"{prefix}_source", v["source"])
         width = int(v.get(f"{prefix}_width", v["width"]))
         height = int(v.get(f"{prefix}_height", v["height"]))
-        return source, width, height
+        fps = int(v.get(f"{prefix}_fps", v.get("fps", 60)))
+        return source, width, height, fps
 
     def _build_shot_logic(self, rim_center: tuple) -> "ShotLogic":
         h = self.cfg.shot_logic
@@ -285,6 +310,7 @@ class WorkoutRuntime:
             net_flow_threshold=float(h.get("net_flow_threshold", 1.5)),
             min_tracking_frames=int(h.get("min_tracking_frames", 10)),
             min_travel_px=float(h.get("min_travel_px", 150.0)),
+            min_launch_velocity_px=float(h.get("min_launch_velocity_px", 5.0)),
             weights=h.get("weights"),
         )
 
@@ -317,10 +343,10 @@ class WorkoutRuntime:
             wide_stride = max(1, int(cfg.get("wide_stride", 2)))
             use_detection = bool(cfg.get("use_detection", True))
 
-            rim_source, rim_w, rim_h = self._camera_settings("rim")
-            wide_source, wide_w, wide_h = self._camera_settings("wide")
-            rim_cam = Camera(rim_source, rim_w, rim_h)
-            wide_cam = Camera(wide_source, wide_w, wide_h)
+            rim_source, rim_w, rim_h, rim_fps = self._camera_settings("rim")
+            wide_source, wide_w, wide_h, wide_fps = self._camera_settings("wide")
+            rim_cam = Camera(rim_source, rim_w, rim_h, fps=rim_fps)
+            wide_cam = Camera(wide_source, wide_w, wide_h, fps=wide_fps)
 
             rim_detector = build_detector(self.cfg.raw.get("detector_rim", self.cfg.raw.get("detector", {})))
             wide_detector = build_detector(self.cfg.raw.get("detector_wide", self.cfg.raw.get("detector", {})))
@@ -413,10 +439,10 @@ class WorkoutRuntime:
         store = None
 
         try:
-            rim_source, rim_w, rim_h = self._camera_settings("rim")
-            wide_source, wide_w, wide_h = self._camera_settings("wide")
-            rim_cam = Camera(rim_source, rim_w, rim_h)
-            wide_cam = Camera(wide_source, wide_w, wide_h)
+            rim_source, rim_w, rim_h, rim_fps = self._camera_settings("rim")
+            wide_source, wide_w, wide_h, wide_fps = self._camera_settings("wide")
+            rim_cam = Camera(rim_source, rim_w, rim_h, fps=rim_fps)
+            wide_cam = Camera(wide_source, wide_w, wide_h, fps=wide_fps)
 
             rim_detector = build_detector(self.cfg.raw.get("detector_rim", self.cfg.raw.get("detector", {})))
             wide_detector = build_detector(self.cfg.raw.get("detector_wide", self.cfg.raw.get("detector", {})))
@@ -440,6 +466,9 @@ class WorkoutRuntime:
                 self._emit("warning", message="rim_center_px missing; using fallback")
 
             shot_logic = self._build_shot_logic(rim_center)
+            rim_radius_px = self.cfg.shot_logic.get("rim_radius_px", 42)
+            excl_scale = self.cfg.raw.get("detector", {}).get("rim_exclusion_scale", 1.5)
+            rim_detector.set_rim(rim_center, int(rim_radius_px * excl_scale))
 
             # Skeleton choice: location mapping uses wide stream calibration.
             wide_mapper = self._build_mapper_from_calibration("wide_court_image_points")
@@ -451,7 +480,8 @@ class WorkoutRuntime:
             )
             self._emit("status", running=True, makes=0, total=0, fg_percent=0.0)
 
-            last_wide_center: Optional[Tuple[int, int]] = None
+            shot_start_foot_px: Optional[Tuple[int, int]] = None
+            prev_has_attempt = False
             frame_idx = 0
 
             while not self._stop_evt.is_set():
@@ -463,25 +493,31 @@ class WorkoutRuntime:
 
                 frame_idx += 1
                 rim_track = rim_tracker.update(rim_detector.detect(rim_frame))
-                wide_track = wide_tracker.update(wide_detector.detect(wide_frame))
+                wide_tracker.update(wide_detector.detect(wide_frame))
                 rim_center_px = rim_track.center if rim_track is not None else None
-                if wide_track is not None:
-                    last_wide_center = wide_track.center
-
                 done = shot_logic.update(rim_center_px, rim_frame)
+
+                # Capture foot position (from rim camera) at the moment an attempt is triggered
+                has_attempt = shot_logic.current is not None
+                if has_attempt and not prev_has_attempt:
+                    feet = rim_detector.detect_person_feet()
+                    shot_start_foot_px = feet[0] if feet else None
+                prev_has_attempt = has_attempt
+
                 if done is not None:
                     total += 1
                     if done.result == "make":
                         makes += 1
 
-                    # Proxy mapping from latest wide center. Replace with release-synced mapping later.
-                    court_xy = wide_mapper.map_pixel_to_court(last_wide_center) if last_wide_center is not None else None
+                    location_px = shot_start_foot_px if shot_start_foot_px is not None else done.start_px
+                    shot_start_foot_px = None
+                    court_xy = wide_mapper.map_pixel_to_court(location_px)
                     store.add_shot(
                         shot_id=done.id,
                         frame_start=done.start_frame,
                         frame_end=done.end_frame,
                         result=done.result,
-                        start_px=done.start_px,
+                        start_px=location_px,
                         court_xy=court_xy,
                     )
                     fg = (makes / total * 100.0) if total else 0.0
@@ -489,7 +525,7 @@ class WorkoutRuntime:
                         "shot",
                         shot_id=done.id,
                         result=done.result,
-                        start_px=done.start_px,
+                        start_px=location_px,
                         court_xy=court_xy,
                         makes=makes,
                         total=total,

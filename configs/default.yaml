@@ -2,19 +2,25 @@ video:
   source: 0
   width: 1280
   height: 720
+  fps: 60          # request MJPEG + 60fps from camera; use 120 if shooting at 640x480
   rim_source: 0
   rim_width: 1280
   rim_height: 720
+  rim_fps: 60
   wide_source: 1
   wide_width: 1280
   wide_height: 720
+  wide_fps: 60
 
 detector:
   backend: yolo
   model_path: yolov8n.pt
-  confidence: 0.25
+  confidence: 0.45          # raised from 0.25; reduces gym-environment false positives
   ball_class_ids: [32]
   max_detections: 3
+  use_motion_mask: true     # BGS suppresses stationary objects (rim, floor markings)
+  rim_exclusion_scale: 1.5  # exclusion radius = rim_radius_px * this value
+  motion_overlap_threshold: 10.0  # mean fg-mask value a bbox must exceed to be accepted
 
 tracking:
   max_distance_px: 80
@@ -25,25 +31,30 @@ shot_logic:
   score_cooldown_frames: 15
   make_confirm_frames: 3
   miss_timeout_frames: 55
-  min_shot_arc_drop_px: 28
-  entry_above_margin_px: 8
-  net_drop_margin_px: 14
-  net_lane_radius_scale: 0.8
+  # --- Top-down backboard camera geometry ---
+  # Camera is mounted flush behind backboard, angled downward.
+  # Ball approaches rim from below in the frame (large y → small y).
+  # Arc appears flat in pixel space; drop margin and lane tuned accordingly.
+  min_shot_arc_drop_px: 8    # was 28 — top-down arcs show very little y-drop in pixels
+  entry_above_margin_px: -55 # was 8  — fires when ball is at/near rim height (not strictly above)
+  net_drop_margin_px: 8      # was 14 — net is close to rim in pixel space from top-down
+  net_lane_radius_scale: 1.1 # was 0.8 — net opening appears as full circle from above
   net_confirm_frames: 2
 
   # --- Confidence scoring ---
   # Set use_confidence_scoring: false to fall back to the original AND logic.
   use_confidence_scoring: true
-  make_threshold: 60       # score >= threshold → make  (max possible ~95)
+  make_threshold: 55       # was 60 — compensates for reduced above_rim weight
   net_flow_threshold: 1.5  # mean optical flow magnitude in net ROI to trigger net signal
   min_tracking_frames: 10  # gate: frames ball must be tracked before a shot is counted
-  min_travel_px: 150.0     # gate: pixels ball must travel before scoring zone entry
+  min_travel_px: 80.0      # was 150 — top-down view compresses distance; close shots travel fewer px
+  min_launch_velocity_px: 5.0  # gate: mean px/frame speed over last 6 positions; 0 to disable
   weights:
-    above_rim_entry:  20   # ball was seen above the rim plane
-    inside_rim_zone:  20   # ball sustained inside scoring zone (baseline signal)
-    net_lane_passage: 35   # ball passed downward through net lane (strongest make signal)
-    net_optical_flow: 20   # motion detected in net ROI via optical flow
-    bounce_away:     -50   # ball moved away from rim after scoring zone entry
+    above_rim_entry:   5   # was 20 — unreliable from top-down; ball rarely appears above rim_y
+    inside_rim_zone:  32   # was 20 — best geometric signal from top-down (looking into rim circle)
+    net_lane_passage: 40   # was 35 — primary make signal; downward motion check already in code
+    net_optical_flow: 25   # was 20 — angle-independent; net moves on any make
+    bounce_away:     -50   # unchanged — ball exiting rim zone quickly still indicates miss
 
 calibration:
   court_width_ft: 50.0

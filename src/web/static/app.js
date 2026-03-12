@@ -11,7 +11,7 @@
 // ════════════════════════════════════════════════════════════
 
 const App = {
-  screen: "player-select",
+  screen: "boot",
   players: [],      // [{id, name, career, modes, sessions}]
   modes: [],        // [{name, end_trigger, timer_sec?}]
   currentPlayer: null,
@@ -107,7 +107,7 @@ function clearIdleTimer() {
 }
 
 function canEnterIdleMode() {
-  return App.screen !== "live" && !App.session.running && App.screen !== "idle-leaderboard";
+  return App.screen !== "live" && App.screen !== "boot" && !App.session.running && App.screen !== "idle-leaderboard";
 }
 
 function scheduleIdleTimer() {
@@ -1181,6 +1181,8 @@ function pollGamepad() {
 }
 
 function onButton(btn) {
+  if (App.screen === "boot") { dismissBoot(); return; }
+
   const wokeFromIdle = noteUserActivity();
   if (wokeFromIdle) return;
 
@@ -1267,6 +1269,8 @@ function clamp(val, min, max) {
 // ════════════════════════════════════════════════════════════
 
 document.addEventListener("keydown", (e) => {
+  if (App.screen === "boot") { dismissBoot(); return; }
+
   const wokeFromIdle = noteUserActivity();
   if (wokeFromIdle) {
     e.preventDefault();
@@ -1312,20 +1316,72 @@ document.addEventListener("mouseover", (e) => {
 });
 
 // ════════════════════════════════════════════════════════════
+// BOOT SCREEN
+// ════════════════════════════════════════════════════════════
+
+let _appInitFn = null;       // called when boot is dismissed
+let _bootMinExpired = false; // true after minimum show time
+let _bootDismissed = false;
+
+// Minimum time boot screen stays visible
+const BOOT_MIN_MS = 3500;
+
+setTimeout(() => {
+  _bootMinExpired = true;
+  // If user already pressed something, go now
+  if (_bootDismissed && _appInitFn) _appInitFn();
+}, BOOT_MIN_MS);
+
+function dismissBoot() {
+  if (App.screen !== "boot") return;
+  _bootDismissed = true;
+  if (!_bootMinExpired) return; // wait for minimum time
+  if (!_appInitFn) return;      // wait for data load
+  _runBoot();
+}
+
+function _runBoot() {
+  const bootEl = document.getElementById("screen-boot");
+  bootEl.classList.add("boot-exit-flash");
+  setTimeout(() => {
+    _appInitFn();
+    _appInitFn = null;
+  }, 450);
+}
+
+// ════════════════════════════════════════════════════════════
 // INIT
 // ════════════════════════════════════════════════════════════
 
 async function init() {
+  // Show boot screen immediately; load data in background
+  showScreen("boot");
+
+  let bootData = null;
   try {
-    const boot = await api("/api/bootstrap");
+    bootData = await api("/api/bootstrap");
+  } catch (err) {
+    console.error("Failed to initialise:", err);
+  }
+
+  // Define what happens after the boot screen is dismissed
+  _appInitFn = function applyBootData() {
+    // Show school brand on all post-boot screens
+    document.getElementById("school-brand").classList.add("visible");
+
+    if (!bootData) {
+      renderPlayerSelect();
+      showScreen("player-select");
+      return;
+    }
+
+    const boot = bootData;
     setIdleTimeoutFromBoot(boot);
     App.players = sortPlayersByRecentActivity(boot.players ?? []);
     App.modes   = boot.modes   ?? [];
 
-    // If a session was already running when we loaded (e.g. page refresh), handle it
     const state = boot.state ?? {};
     if (state.running) {
-      // Reconnect to live screen
       App.currentPlayer = App.players.find((p) => p.id === state.player_id) ?? null;
       App.currentMode   = App.modes.find((m) => m.name === state.mode) ?? null;
       App.session.makes      = state.makes ?? 0;
@@ -1351,9 +1407,10 @@ async function init() {
       renderPlayerSelect();
       showScreen("player-select");
     }
-  } catch (err) {
-    console.error("Failed to initialise:", err);
-  }
+  };
+
+  // If minimum time already elapsed and user already pressed, go now
+  if (_bootMinExpired && _bootDismissed) _runBoot();
 
   // Static button click handlers
   document.getElementById("btn-add-player").onclick = enterAddPlayer;
