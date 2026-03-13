@@ -256,25 +256,40 @@ class ShotLogic:
     ) -> Optional[ShotAttempt]:
         if ball_center is None or dist is None:
             return None
-        # Ball must be in the outer shot zone but outside the committed zone
-        if not (self._halo_r < dist < self._outer_r):
-            return None
-        # Must have a velocity component toward the rim
-        if not self._moving_toward_rim(ball_center):
+        # Ignore balls completely outside the outer zone (off screen or far away)
+        if dist >= self._outer_r:
             return None
 
-        # Transition → APPROACH
         self.attempt_id += 1
         self.current = ShotAttempt(
             id=self.attempt_id,
             start_frame=self._frame_idx,
             start_px=ball_center,
         )
-        self._approach_dists = [dist]
-        self._approach_pos   = [ball_center]
-        self._phase          = _Phase.APPROACH
-        self._phase_start    = self._frame_idx
-        self._dropout_frames = 0
+        self._last_approach_frame = self._frame_idx
+
+        if dist < self._halo_r:
+            # ── Close shot / layup: ball detected directly inside halo ────────
+            # Skip APPROACH entirely — go straight to COMMITTED.
+            # Common for inside-the-lane shots where the ball is released
+            # close to the rim and never appears in the outer approach zone.
+            self._approach_dists = [dist]
+            self._approach_pos   = [ball_center]
+            self._phase          = _Phase.COMMITTED
+            self._phase_start    = self._frame_idx
+            self._committed_abs  = 0
+            self._recent_dists   = deque(maxlen=self.REVERSAL_WINDOW)
+        else:
+            # ── Normal shot: ball in outer zone, track approach ───────────────
+            if not self._moving_toward_rim(ball_center):
+                self._reset()
+                return None
+            self._approach_dists = [dist]
+            self._approach_pos   = [ball_center]
+            self._phase          = _Phase.APPROACH
+            self._phase_start    = self._frame_idx
+            self._dropout_frames = 0
+
         return None
 
     # ── APPROACH ─────────────────────────────────────────────────────────────
