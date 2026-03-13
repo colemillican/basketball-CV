@@ -71,8 +71,12 @@ class ShotAttempt:
 
 class _Phase(Enum):
     IDLE      = "idle"
-    APPROACH  = "approach"   # ball moving toward rim from court side
-    COMMITTED = "committed"  # ball inside halo zone (2× rim radius)
+    APPROACH  = "approach"   # ball moving toward rim from court side (deep shots)
+    WATCHING  = "watching"   # ball inside halo from close range; watching silently
+                             # no attempt is created yet; no miss can be logged
+                             # resets quietly if ball exits or times out
+    COMMITTED = "committed"  # ball inside halo after APPROACH (deep shots only)
+                             # a miss CAN be logged here
     WAIT_OUT  = "wait_out"   # ball entered scoring zone; watching for outcome
     COOLDOWN  = "cooldown"   # outcome registered; suppressing re-triggers
 
@@ -238,6 +242,8 @@ class ShotLogic:
             return self._idle(ball_center, dist)
         if self._phase == _Phase.APPROACH:
             return self._approach(ball_center, dist)
+        if self._phase == _Phase.WATCHING:
+            return self._watching(ball_center, dist)
         if self._phase == _Phase.COMMITTED:
             return self._committed(ball_center, dist, spike)
         if self._phase == _Phase.WAIT_OUT:
@@ -269,16 +275,17 @@ class ShotLogic:
         self._last_approach_frame = self._frame_idx
 
         if dist < self._halo_r:
-            # ── Close shot / layup: ball detected directly inside halo ────────
-            # Skip APPROACH entirely — go straight to COMMITTED.
-            # Common for inside-the-lane shots where the ball is released
-            # close to the rim and never appears in the outer approach zone.
-            self._approach_dists = [dist]
-            self._approach_pos   = [ball_center]
-            self._phase          = _Phase.COMMITTED
+            # ── Close shot / layup: ball inside halo on first detection ───────
+            # Go to WATCHING — a silent observation phase.
+            # No ShotAttempt is created yet and no miss can be logged.
+            # We only commit once the ball enters the scoring zone, which
+            # filters dribbles and passes that stay in the halo but never
+            # actually go through the rim.
+            self._watching_start = self._frame_idx
+            self._watching_pos   = ball_center
+            self._phase          = _Phase.WATCHING
             self._phase_start    = self._frame_idx
-            self._committed_abs  = 0
-            self._recent_dists   = deque(maxlen=self.REVERSAL_WINDOW)
+            return None
         else:
             # ── Normal shot: ball in outer zone, track approach ───────────────
             if not self._moving_toward_rim(ball_center):
@@ -336,6 +343,51 @@ class ShotLogic:
                 return None
 
         if elapsed > self.APPROACH_TIMEOUT:
+            self._reset()
+        return None
+
+    # ── WATCHING ─────────────────────────────────────────────────────────────
+
+    # Max frames to watch without the ball entering the scoring zone before
+    # quietly giving up. Keep short — a real shot reaches the zone quickly.
+    WATCHING_TIMEOUT = 30
+
+    def _watching(
+        self,
+        ball_center: Optional[Tuple[int, int]],
+        dist: Optional[float],
+    ) -> Optional[ShotAttempt]:
+        """
+        Silent observation phase for close-range shots.
+        No ShotAttempt exists yet; no miss is ever logged here.
+        We only escalate when the ball enters the scoring zone.
+        Dribbles and passes through the halo zone fall through quietly.
+        """
+        elapsed = self._frame_idx - self._phase_start
+
+        if ball_center is not None and dist is not None:
+            # Ball entered the scoring zone → it's a real attempt
+            if dist < self._scoring_r:
+                self.attempt_id += 1
+                self.current = ShotAttempt(
+                    id=self.attempt_id,
+                    start_frame=self._frame_idx,
+                    start_px=ball_center,
+                )
+                self._last_approach_frame = self._frame_idx
+                self._phase          = _Phase.WAIT_OUT
+                self._phase_start    = self._frame_idx
+                self._absent_scoring = 0
+                self._flow_confirm   = 0
+                return None
+
+            # Ball exited halo entirely — not a shot, reset silently
+            if dist > self._halo_r * 1.2:
+                self._reset()
+                return None
+
+        # Timeout without entering scoring zone — dribble or pass, ignore
+        if elapsed > self.WATCHING_TIMEOUT:
             self._reset()
         return None
 
@@ -559,3 +611,5 @@ class ShotLogic:
         self._absent_scoring  = 0
         self._flow_confirm    = 0
         self._dropout_frames  = 0
+        self._watching_start  = -1
+        self._watching_pos: Optional[Tuple[int, int]] = None

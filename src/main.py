@@ -116,8 +116,10 @@ def draw_debug_overlay(
 
     # Phase colour: green = active, yellow = committed/wait, grey = idle/cooldown
     phase_color = (180, 180, 180)
-    if phase in ("approach",):
+    if phase == "approach":
         phase_color = (50, 200, 50)
+    elif phase == "watching":
+        phase_color = (0, 180, 180)   # teal — observing, no commitment yet
     elif phase in ("committed", "wait_out"):
         phase_color = (0, 200, 255)
 
