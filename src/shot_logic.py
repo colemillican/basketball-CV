@@ -374,11 +374,13 @@ class ShotLogic:
                     start_frame=self._frame_idx,
                     start_px=ball_center,
                 )
-                self._last_approach_frame = self._frame_idx
-                self._phase          = _Phase.WAIT_OUT
-                self._phase_start    = self._frame_idx
-                self._absent_scoring = 0
-                self._flow_confirm   = 0
+                self._last_approach_frame  = self._frame_idx
+                self._phase                = _Phase.WAIT_OUT
+                self._phase_start          = self._frame_idx
+                self._absent_scoring       = 0
+                self._absent_retreating    = 0
+                self._last_in_scoring      = True
+                self._flow_confirm         = 0
                 return None
 
             # Ball exited halo entirely — not a shot, reset silently
@@ -407,10 +409,12 @@ class ShotLogic:
 
             # ── Entered scoring zone → WAIT_OUT ───────────────────────────────
             if dist < self._scoring_r:
-                self._phase          = _Phase.WAIT_OUT
-                self._phase_start    = self._frame_idx
-                self._absent_scoring = 0
-                self._flow_confirm   = 0
+                self._phase             = _Phase.WAIT_OUT
+                self._phase_start       = self._frame_idx
+                self._absent_scoring    = 0
+                self._absent_retreating = 0
+                self._last_in_scoring   = True
+                self._flow_confirm      = 0
                 return None
 
             # ── Ball reversed sharply away from rim → MISS ────────────────────
@@ -432,39 +436,68 @@ class ShotLogic:
 
     # ── WAIT_OUT ─────────────────────────────────────────────────────────────
 
+    # Frames ball must be absent while retreating before calling miss.
+    # A small buffer handles brief YOLO dropout while ball is still in halo.
+    RETREATING_MISS_FRAMES = 3
+
     def _wait_out(
         self,
         ball_center: Optional[Tuple[int, int]],
         dist: Optional[float],
         spike: bool,
     ) -> Optional[ShotAttempt]:
-        """Ball entered the rim interior. Confirm make or miss."""
+        """
+        Ball entered the rim interior. Confirm make or miss.
+
+        The core distinction:
+          MAKE — ball was last seen inside the scoring zone and then disappears
+                 (it fell below the rim plane into the net, camera loses it)
+          MISS — ball retreats to the halo zone and then disappears
+                 (bounced upward/sideways out of the frame, never went through)
+
+        We track _last_in_scoring to know which case applies when the ball
+        goes absent, so a ball bouncing straight up out of frame is not
+        mistaken for a make.
+        """
         elapsed = self._frame_idx - self._phase_start
 
         if ball_center is not None and dist is not None:
             if dist > self._halo_r:
                 # Ball reappeared well outside the rim — bounced back out → MISS
                 return self._register("miss")
-            if dist < self._scoring_r:
-                self._absent_scoring = 0   # still tracked inside scoring zone
-            else:
-                self._absent_scoring += 1  # in halo but not in scoring center
-        else:
-            # Lost tracking — most likely the ball fell through the net
-            self._absent_scoring += 1
 
-        # Net pixel-diff spike only counts once ball has already disappeared.
-        # If ball is still visible, the spike is just the ball flying over the
-        # net ROI on its way to/past the rim — fires on misses too.
-        if spike and self._absent_scoring >= 1:
+            if dist < self._scoring_r:
+                # Ball still inside scoring zone
+                self._last_in_scoring    = True
+                self._absent_scoring     = 0
+                self._absent_retreating  = 0
+            else:
+                # Ball in halo but outside scoring zone — retreating
+                self._last_in_scoring    = False
+                self._absent_retreating += 1
+
+        else:
+            # Ball absent — direction at disappearance determines outcome
+            if self._last_in_scoring:
+                # Disappeared from inside scoring zone → fell through net → MAKE candidate
+                self._absent_scoring += 1
+            else:
+                # Disappeared while retreating (in halo) → bounced away → MISS
+                self._absent_retreating += 1
+                if self._absent_retreating >= self.RETREATING_MISS_FRAMES:
+                    return self._register("miss")
+
+        # Net pixel-diff spike only counts when ball has already disappeared
+        # from inside the scoring zone. A spike while retreating just means
+        # the ball was flying past the net ROI, not going through it.
+        if spike and self._last_in_scoring and self._absent_scoring >= 1:
             self._flow_confirm += 1
             if self._flow_confirm >= self.NET_DIFF_SPIKE_HOLD:
                 return self._register("make")
         else:
             self._flow_confirm = 0
 
-        # Ball disappeared from scoring zone for N consecutive frames → MAKE
-        # (ball fell below the rim plane into the net)
+        # Ball disappeared from inside scoring zone for N frames → MAKE
         if self._absent_scoring >= self.DISAPPEAR_FRAMES:
             return self._register("make")
 
@@ -610,6 +643,8 @@ class ShotLogic:
         self._committed_abs   = 0
         self._absent_scoring  = 0
         self._flow_confirm    = 0
-        self._dropout_frames  = 0
-        self._watching_start  = -1
+        self._dropout_frames      = 0
+        self._watching_start      = -1
         self._watching_pos: Optional[Tuple[int, int]] = None
+        self._last_in_scoring     = False
+        self._absent_retreating   = 0
