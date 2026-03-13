@@ -237,7 +237,7 @@ class ShotLogic:
         if self._phase == _Phase.IDLE:
             return self._idle(ball_center, dist)
         if self._phase == _Phase.APPROACH:
-            return self._approach(ball_center, dist, spike)
+            return self._approach(ball_center, dist)
         if self._phase == _Phase.COMMITTED:
             return self._committed(ball_center, dist, spike)
         if self._phase == _Phase.WAIT_OUT:
@@ -283,7 +283,6 @@ class ShotLogic:
         self,
         ball_center: Optional[Tuple[int, int]],
         dist: Optional[float],
-        spike: bool,
     ) -> Optional[ShotAttempt]:
         elapsed = self._frame_idx - self._phase_start
 
@@ -321,10 +320,6 @@ class ShotLogic:
                 self._reset()
                 return None
 
-        # Net diff spike during approach (ball very close, slipped through fast) → make
-        if spike:
-            return self._register("make")
-
         if elapsed > self.APPROACH_TIMEOUT:
             self._reset()
         return None
@@ -360,13 +355,9 @@ class ShotLogic:
         else:
             # Ball vanished inside the halo zone
             self._committed_abs += 1
-            # If net also spiked, very likely a make (ball fell through quickly)
-            if spike and self._committed_abs >= 2:
+            # Net spike + ball already absent = fell through quickly
+            if spike and self._committed_abs >= 3:
                 return self._register("make")
-
-        # Net diff spike while tracking → ball passed through scoring zone fast
-        if spike:
-            return self._register("make")
 
         if elapsed > self.COMMITTED_TIMEOUT:
             return self._register("miss")
@@ -395,8 +386,10 @@ class ShotLogic:
             # Lost tracking — most likely the ball fell through the net
             self._absent_scoring += 1
 
-        # Net pixel-diff spike = ball deforming the net
-        if spike:
+        # Net pixel-diff spike only counts once ball has already disappeared.
+        # If ball is still visible, the spike is just the ball flying over the
+        # net ROI on its way to/past the rim — fires on misses too.
+        if spike and self._absent_scoring >= 1:
             self._flow_confirm += 1
             if self._flow_confirm >= self.NET_DIFF_SPIKE_HOLD:
                 return self._register("make")
