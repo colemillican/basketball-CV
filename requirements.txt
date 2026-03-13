@@ -1,4 +1,14 @@
-opencv-python>=4.8.0
+# opencv-python is intentionally excluded.
+# On Jetson, pip opencv has no GStreamer support — use system apt package instead:
+#   sudo apt install python3-opencv
+# The venv must be created with --system-site-packages to see it:
+#   python3 -m venv --system-site-packages hoops_env
+
+# torch is intentionally excluded.
+# On Jetson (JetPack 6 / CUDA 12.6), install the Jetson-specific wheel:
+#   pip install torch --extra-index-url https://pypi.jetson-ai-lab.dev/jp6/cu126
+# Standard pip torch has no CUDA support on Jetson.
+
 numpy>=1.24.0
 matplotlib>=3.7.0
 PyYAML>=6.0.0

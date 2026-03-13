@@ -144,6 +144,7 @@ class YoloBallDetector(BaseBallDetector):
             source=frame,
             conf=self.confidence,
             verbose=False,
+            device="cuda",
         )
         results = self._last_results
         if not results:

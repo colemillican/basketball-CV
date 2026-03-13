@@ -58,6 +58,7 @@ class ShotLogic:
         min_tracking_frames: int = 10,
         min_travel_px: float = 150.0,
         min_launch_velocity_px: float = 5.0,
+        launch_region_scale: float = 2.2,
         weights: Optional[Dict[str, float]] = None,
     ) -> None:
         self.rim_center = rim_center
@@ -77,6 +78,7 @@ class ShotLogic:
         self.min_tracking_frames = min_tracking_frames
         self.min_travel_px = min_travel_px
         self.min_launch_velocity_px = min_launch_velocity_px
+        self.launch_region_scale = launch_region_scale
 
         _default_weights: Dict[str, float] = {
             "above_rim_entry":  20.0,
@@ -220,7 +222,11 @@ class ShotLogic:
             if sum(vels) / len(vels) < self.min_launch_velocity_px:
                 return
 
-        if self._is_in_launch_region(ball_center) and arc_drop > self.min_shot_arc_drop_px:
+        # Ball must be moving toward the rim (filters dribbles which stay in place)
+        dists = [self._distance_to_rim(p) for p in positions]
+        approaching = dists[-1] < dists[0] - 20
+
+        if self._is_in_launch_region(ball_center) and arc_drop > self.min_shot_arc_drop_px and approaching:
             self.attempt_id += 1
             self.current = ShotAttempt(
                 id=self.attempt_id,
@@ -347,7 +353,7 @@ class ShotLogic:
         return ((p[0] - rx) ** 2 + (p[1] - ry) ** 2) ** 0.5
 
     def _is_in_launch_region(self, p: Tuple[int, int]) -> bool:
-        return self._distance_to_rim(p) > self.rim_radius_px * 2.2
+        return self._distance_to_rim(p) > self.rim_radius_px * self.launch_region_scale
 
     def _is_in_scoring_zone(self, p: Tuple[int, int]) -> bool:
         return self._distance_to_rim(p) <= self.rim_radius_px * 1.1

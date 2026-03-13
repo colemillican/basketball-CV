@@ -5,7 +5,7 @@ import cv2
 
 class Camera:
     def __init__(self, source: int | str, width: int, height: int, fps: int = 60) -> None:
-        self.cap = cv2.VideoCapture(source)
+        self.cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
         # Request MJPEG from the camera before setting resolution/fps.
         # MJPEG compresses each frame before USB transmission, cutting bandwidth
         # ~10x vs YUYV and unlocking higher framerates on USB cameras.

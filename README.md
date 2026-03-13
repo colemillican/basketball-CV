@@ -35,6 +35,26 @@ Live-camera computer vision prototype for basketball workouts:
 - `configs/default.yaml`: runtime config.
 
 ## Install
+
+**On Jetson (JetPack 6 / CUDA 12.6):**
+
+`opencv-python` from pip has no GStreamer support on Jetson — use the system package instead:
+```bash
+sudo apt install python3-opencv
+```
+
+Create your venv with `--system-site-packages` so it can see the apt OpenCV:
+```bash
+python3 -m venv --system-site-packages hoops_env
+source hoops_env/bin/activate
+```
+
+Install the Jetson-specific PyTorch wheel (standard pip torch has no CUDA on Jetson):
+```bash
+pip install torch --extra-index-url https://pypi.jetson-ai-lab.dev/jp6/cu126
+```
+
+Then install the remaining dependencies:
 ```bash
 pip install -r requirements.txt
 ```
