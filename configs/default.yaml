@@ -27,35 +27,39 @@ tracking:
   max_missed_frames: 20
 
 shot_logic:
-  rim_radius_px: 42
-  score_cooldown_frames: 15
-  make_confirm_frames: 1
-  miss_timeout_frames: 55
-  # --- Top-down backboard camera geometry ---
-  # Camera is mounted flush behind backboard, angled downward.
-  # Ball approaches rim from below in the frame (large y → small y).
-  # Arc appears flat in pixel space; drop margin and lane tuned accordingly.
-  min_shot_arc_drop_px: 8    # was 28 — top-down arcs show very little y-drop in pixels
-  entry_above_margin_px: -55 # was 8  — fires when ball is at/near rim height (not strictly above)
-  net_drop_margin_px: 8      # was 14 — net is close to rim in pixel space from top-down
-  net_lane_radius_scale: 1.1 # was 0.8 — net opening appears as full circle from above
-  net_confirm_frames: 1
+  # ── Core ──────────────────────────────────────────────────────────────────
+  score_cooldown_frames: 45   # frames to suppress re-detection after each shot
 
-  # --- Confidence scoring ---
-  # Set use_confidence_scoring: false to fall back to the original AND logic.
-  use_confidence_scoring: true
-  make_threshold: 35       # inside_rim_zone(32) + above_rim_entry(5) = 37 > 35
-  net_flow_threshold: 1.5  # mean optical flow magnitude in net ROI to trigger net signal
-  min_tracking_frames: 10  # gate: frames ball must be tracked before a shot is counted
-  min_travel_px: 80.0      # was 150 — top-down view compresses distance; close shots travel fewer px
-  min_launch_velocity_px: 6.0   # lowered — threaded YOLO repeats positions, reducing apparent velocity
-  launch_region_scale: 1.3      # reduced from 2.2 — rim appears large (314px) in close-mounted camera
-  weights:
-    above_rim_entry:   5   # was 20 — unreliable from top-down; ball rarely appears above rim_y
-    inside_rim_zone:  32   # was 20 — best geometric signal from top-down (looking into rim circle)
-    net_lane_passage: 40   # was 35 — primary make signal; downward motion check already in code
-    net_optical_flow: 25   # was 20 — angle-independent; net moves on any make
-    bounce_away:     -50   # unchanged — ball exiting rim zone quickly still indicates miss
+  # ── Net-ROI pixel-diff threshold ──────────────────────────────────────────
+  # Mean absolute pixel change inside the net interior circle.
+  # Tune this first when setting up in a new gym.
+  #   Still net baseline:  ~2–5
+  #   Net sway (AC/fans):  ~5–9
+  #   Ball through net:    ~10–30+
+  # Raise if you get false makes from net sway; lower if real makes are missed.
+  net_diff_threshold: 10.0
+
+  # ── Zone geometry (all as multiples of the fitted rim_radius_px) ──────────
+  # These are class-level defaults in shot_logic.py; listed here for reference.
+  # To override them, add a Python subclass or edit the constants directly.
+  #   OUTER_SCALE:   5.0   outer boundary of "in-play" zone
+  #   HALO_SCALE:    1.8   committed zone (ball locked in on the rim)
+  #   SCORING_SCALE: 1.05  inside the rim opening
+  #   NET_ROI_SCALE: 0.72  net interior for pixel-diff sampling
+
+  # ── Approach anti-false-positive gates ────────────────────────────────────
+  #   MIN_APPROACH_FRAMES:  5    frames ball must be converging
+  #   MIN_DISTANCE_CLOSED:  50   px ball must close toward rim
+  #   CONVERGE_RATIO:       0.60 fraction of frames that must be converging
+
+  # ── Make detection ─────────────────────────────────────────────────────────
+  #   NET_DIFF_SPIKE_HOLD:  2    consecutive spike frames to confirm make
+  #   DISAPPEAR_FRAMES:     5    frames absent inside scoring zone → make
+  #   WAIT_OUT_TIMEOUT:     35   frames in wait_out before calling miss
+
+  # ── Fallback (YOLO-dead) ───────────────────────────────────────────────────
+  #   APPROACH_MEMORY_FRAMES:   90    remember approach for this many frames
+  #   FALLBACK_DIFF_MULTIPLIER: 1.4   fallback needs 1.4× threshold (stricter)
 
 calibration:
   court_width_ft: 50.0

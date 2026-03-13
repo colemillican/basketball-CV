@@ -88,43 +88,48 @@ def draw_debug_overlay(
     fps: float,
 ) -> None:
     rx, ry = debug["rim_center"]
-    scoring_radius = debug["scoring_radius"]
-    entry_y = debug["entry_line_y"]
-    net_y = debug["net_line_y"]
-    net_x1 = debug["net_lane_x_left"]
-    net_x2 = debug["net_lane_x_right"]
     h, w = frame.shape[:2]
 
-    # Scoring zone around rim center
-    cv2.circle(frame, (rx, ry), scoring_radius, (0, 180, 255), 1)
+    # Scoring zone (inside rim)
+    cv2.circle(frame, (rx, ry), debug["scoring_radius"], (0, 180, 255), 1)
 
-    # Rim exclusion zone (detections inside here are suppressed)
-    cv2.circle(frame, (rx, ry), rim_excl_radius, (0, 60, 220), 1)
+    # Halo zone (committed threshold)
+    cv2.circle(frame, (rx, ry), debug["halo_radius"], (0, 60, 220), 1)
 
-    # Entry line: ball should be seen above this during an attempt
-    cv2.line(frame, (0, max(0, entry_y)), (w - 1, max(0, entry_y)), (90, 180, 255), 1)
-
-    # Net lane rectangle: downward pass through this confirms make
-    top = max(0, net_y)
-    cv2.rectangle(frame, (max(0, net_x1), top), (min(w - 1, net_x2), h - 1), (0, 220, 120), 1)
+    # Net ROI circle (pixel-diff sampling region)
+    cv2.circle(frame, (rx, ry), debug["net_roi_radius"], (0, 220, 120), 1)
 
     # Tracked ball position
     if ball_center is not None:
         cv2.circle(frame, ball_center, max(ball_radius, 9), (0, 255, 255), 2)
         cv2.drawMarker(frame, ball_center, (0, 255, 255), cv2.MARKER_CROSS, 14, 1)
 
-    # Player foot position used for shot location
+    # Player foot position
     if foot_px is not None:
         cv2.drawMarker(frame, foot_px, (255, 80, 0), cv2.MARKER_TRIANGLE_UP, 18, 2)
 
+    phase   = debug.get("phase", "?")
+    diff    = debug.get("net_diff", 0.0)
+    spike   = debug.get("diff_spike", False)
+    app_f   = debug.get("approach_frames", 0)
+    absent  = debug.get("absent_scoring", 0)
+
+    # Phase colour: green = active, yellow = committed/wait, grey = idle/cooldown
+    phase_color = (180, 180, 180)
+    if phase in ("approach",):
+        phase_color = (50, 200, 50)
+    elif phase in ("committed", "wait_out"):
+        phase_color = (0, 200, 255)
+
+    cv2.putText(frame, f"PHASE: {phase.upper()}", (18, 92),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.58, phase_color, 2)
     status = (
-        f"A:{int(debug['has_active_attempt'])} "
-        f"AR:{int(debug['seen_above_rim'])} "
-        f"RIM:{debug['inside_rim_frames']} "
-        f"NET:{debug['net_lane_frames']} "
-        f"CONF:{debug['confidence_score']}"
+        f"DIFF:{diff:.1f}{'*' if spike else ' '} "
+        f"APP:{app_f} "
+        f"ABS:{absent} "
+        f"ATT:{int(debug['has_active_attempt'])}"
     )
-    cv2.putText(frame, status, (18, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2)
+    cv2.putText(frame, status, (18, 118), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
     cv2.putText(frame, f"FPS: {fps:.1f}", (w - 110, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 255, 80), 2)
 
 
@@ -268,22 +273,8 @@ def main() -> None:
     shot_logic = ShotLogic(
         rim_center=rim_center,
         rim_radius_px=rim_radius_px,
-        score_cooldown_frames=h_cfg["score_cooldown_frames"],
-        make_confirm_frames=h_cfg["make_confirm_frames"],
-        miss_timeout_frames=h_cfg["miss_timeout_frames"],
-        min_shot_arc_drop_px=h_cfg["min_shot_arc_drop_px"],
-        entry_above_margin_px=h_cfg.get("entry_above_margin_px", 8),
-        net_drop_margin_px=h_cfg.get("net_drop_margin_px", 14),
-        net_lane_radius_scale=h_cfg.get("net_lane_radius_scale", 0.8),
-        net_confirm_frames=h_cfg.get("net_confirm_frames", 2),
-        use_confidence_scoring=bool(h_cfg.get("use_confidence_scoring", True)),
-        make_threshold=float(h_cfg.get("make_threshold", 60.0)),
-        net_flow_threshold=float(h_cfg.get("net_flow_threshold", 1.5)),
-        min_tracking_frames=int(h_cfg.get("min_tracking_frames", 10)),
-        min_travel_px=float(h_cfg.get("min_travel_px", 150.0)),
-        min_launch_velocity_px=float(h_cfg.get("min_launch_velocity_px", 5.0)),
-        launch_region_scale=float(h_cfg.get("launch_region_scale", 2.2)),
-        weights=h_cfg.get("weights"),
+        net_diff_threshold=float(h_cfg.get("net_diff_threshold", 10.0)),
+        score_cooldown_frames=int(h_cfg.get("score_cooldown_frames", 45)),
     )
 
     # Activate rim exclusion zone on the detector now that rim_center is known

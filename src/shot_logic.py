@@ -1,11 +1,62 @@
+"""
+Top-down backboard camera shot logic — v2
+
+CAMERA GEOMETRY
+---------------
+Camera is mounted flush behind / above the backboard, angled ~15° downward.
+The rim appears as a large circle in the lower-center of frame.
+The court and players appear in the upper portion of the frame.
+
+    ┌──────────────────────────────────┐
+    │  (court / players — upper frame) │  ← ball enters from here
+    │                                  │
+    │         ○  ○                     │
+    │       ○      ○   ← halo zone     │
+    │      ○  ●──── ○  ← rim circle    │
+    │      ○  (net) ○                  │
+    │       ○      ○                   │
+    └──────────────────────────────────┘
+
+A MAKE from this angle
+  1. Ball appears in upper frame (court side), moving toward rim.
+  2. Ball enters the halo zone  (within HALO_SCALE × rim_radius).
+  3. Ball enters the scoring zone (inside the rim circle).
+  4. Ball DISAPPEARS — it has fallen below the rim plane into the net.
+     The net interior shows a pixel-change spike.
+
+A MISS from this angle
+  1. Ball approaches rim.
+  2. Ball contacts the rim edge.
+  3. Ball velocity REVERSES — moves away from rim center after contact.
+
+False-positive prevention
+  - Dribbles:     ball oscillates near the player, never sustains a long
+                  approach toward the rim; caught by _sustained_approach().
+  - Passes:       ball crosses the frame with lateral velocity without
+                  decelerating into the halo zone.
+  - Walking:      causes motion but no sustained convergence on rim center.
+  - Net sway:     frame-diff baseline stays low; only a passing ball drives
+                  the diff above NET_DIFF_THRESHOLD.
+
+DETECTION PATHS
+  Primary:   state machine (IDLE→APPROACH→COMMITTED→WAIT_OUTCOME→COOLDOWN)
+             driven by YOLO/tracker ball position.
+  Fallback:  net-ROI pixel-diff spike + recent approach memory → MAKE.
+             Works even when YOLO drops out entirely.
+"""
 from __future__ import annotations
 
+import math
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from enum import Enum
+from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
+
+# ─── Data types ───────────────────────────────────────────────────────────────
 
 @dataclass
 class ShotAttempt:
@@ -18,133 +69,127 @@ class ShotAttempt:
     signal_breakdown: Dict[str, float] = field(default_factory=dict)
 
 
+class _Phase(Enum):
+    IDLE      = "idle"
+    APPROACH  = "approach"   # ball moving toward rim from court side
+    COMMITTED = "committed"  # ball inside halo zone (2× rim radius)
+    WAIT_OUT  = "wait_out"   # ball entered scoring zone; watching for outcome
+    COOLDOWN  = "cooldown"   # outcome registered; suppressing re-triggers
+
+
+# ─── Shot logic ───────────────────────────────────────────────────────────────
+
 class ShotLogic:
     """
-    Detects basketball shot attempts and classifies them as make or miss.
+    Shot detector tuned for top-down backboard camera.
 
-    Two scoring modes (controlled by use_confidence_scoring):
-
-    Legacy mode  — original AND logic: all three conditions must be true.
-                   (seen_above_rim AND inside_rim N frames AND net_lane N frames)
-
-    Confidence mode — weighted multi-signal model. Each signal contributes a
-                   score; score >= make_threshold → make. Signals:
-                     +20  above_rim_entry   ball seen above rim plane
-                     +20  inside_rim_zone   ball held inside scoring zone
-                     +35  net_lane_passage  ball descended through net lane
-                     +20  net_optical_flow  motion in net ROI (optical flow)
-                     -50  bounce_away       ball moved away from rim after entry
-                   Max positive score ≈ 95; default threshold = 60.
-
-    Camera assumption: fixed mount at top of backboard, angled slightly downward.
+    Public API (same as original):
+        update(ball_center, frame) -> Optional[ShotAttempt]
+        debug_state()              -> Dict
+        current                    -> Optional[ShotAttempt]
+        frame_idx                  -> int
     """
+
+    # ── Zone multipliers (× rim_radius_px) ───────────────────────────────────
+    OUTER_SCALE   = 5.0    # beyond this → not in play
+    HALO_SCALE    = 1.8    # "committed" zone
+    SCORING_SCALE = 1.05   # inside the rim opening
+    NET_ROI_SCALE = 0.72   # net interior circle for pixel-diff sampling
+
+    # ── Approach quality ──────────────────────────────────────────────────────
+    MIN_APPROACH_FRAMES  = 5     # frames the ball must be tracked converging
+    MIN_DISTANCE_CLOSED  = 50    # px the ball must close toward rim
+    CONVERGE_RATIO       = 0.60  # fraction of frames that must be converging
+    MAX_APPROACH_DROPOUT = 12    # consecutive undetected frames before cancelling
+    APPROACH_TIMEOUT     = 90    # total frames in APPROACH before cancelling
+
+    # ── Make detection ────────────────────────────────────────────────────────
+    # Pixel-diff threshold: mean absolute pixel change in net interior circle.
+    # Baseline (still net):  ~2–5.   Ball through net: ~10–30+.
+    NET_DIFF_THRESHOLD   = 10.0  # tune up if false positives from net sway
+    NET_DIFF_SPIKE_HOLD  = 2     # consecutive frames above threshold to confirm
+    DISAPPEAR_FRAMES     = 5     # frames ball absent inside scoring zone → make
+    WAIT_OUT_TIMEOUT     = 35    # frames in WAIT_OUT before calling miss
+
+    # ── Miss detection ────────────────────────────────────────────────────────
+    REVERSAL_RATIO    = 0.60   # fraction of recent frames diverging = reversal
+    REVERSAL_WINDOW   = 8
+    COMMITTED_TIMEOUT = 50     # frames in COMMITTED without outcome → miss
+
+    # ── Cooldown / suppression ────────────────────────────────────────────────
+    COOLDOWN_FRAMES = 45
+
+    # ── Fallback (net-diff only, no ball) ─────────────────────────────────────
+    # If YOLO is dead but approach activity was recently seen, a net-diff spike
+    # alone can trigger a make.
+    APPROACH_MEMORY_FRAMES   = 90   # frames we remember "approach was active"
+    FALLBACK_DIFF_MULTIPLIER = 1.4  # fallback needs higher diff to avoid false pos
 
     def __init__(
         self,
         rim_center: Tuple[int, int],
         rim_radius_px: int,
-        score_cooldown_frames: int = 15,
-        make_confirm_frames: int = 3,
-        miss_timeout_frames: int = 55,
-        min_shot_arc_drop_px: int = 28,
-        entry_above_margin_px: int = 8,
-        net_drop_margin_px: int = 14,
-        net_lane_radius_scale: float = 0.8,
-        net_confirm_frames: int = 2,
-        # Confidence scoring params
-        use_confidence_scoring: bool = True,
-        make_threshold: float = 60.0,
-        net_flow_threshold: float = 1.5,
-        min_tracking_frames: int = 10,
-        min_travel_px: float = 150.0,
-        min_launch_velocity_px: float = 5.0,
-        launch_region_scale: float = 2.2,
-        weights: Optional[Dict[str, float]] = None,
+        # ── Tunable overrides (also accepts old param names silently) ─────────
+        net_diff_threshold: float = NET_DIFF_THRESHOLD,
+        score_cooldown_frames: int = COOLDOWN_FRAMES,
+        **_,  # absorb legacy params (ignored)
     ) -> None:
-        self.rim_center = rim_center
-        self.rim_radius_px = rim_radius_px
-        self.score_cooldown_frames = score_cooldown_frames
-        self.make_confirm_frames = make_confirm_frames
-        self.miss_timeout_frames = miss_timeout_frames
-        self.min_shot_arc_drop_px = min_shot_arc_drop_px
-        self.entry_above_margin_px = entry_above_margin_px
-        self.net_drop_margin_px = net_drop_margin_px
-        self.net_lane_radius_scale = net_lane_radius_scale
-        self.net_confirm_frames = net_confirm_frames
+        self.rim_center  = rim_center
+        self.rim_radius  = rim_radius_px
 
-        self.use_confidence_scoring = use_confidence_scoring
-        self.make_threshold = make_threshold
-        self.net_flow_threshold = net_flow_threshold
-        self.min_tracking_frames = min_tracking_frames
-        self.min_travel_px = min_travel_px
-        self.min_launch_velocity_px = min_launch_velocity_px
-        self.launch_region_scale = launch_region_scale
+        self.NET_DIFF_THRESHOLD = net_diff_threshold
+        self.COOLDOWN_FRAMES    = score_cooldown_frames
 
-        _default_weights: Dict[str, float] = {
-            "above_rim_entry":  20.0,
-            "inside_rim_zone":  20.0,
-            "net_lane_passage": 35.0,
-            "net_optical_flow": 20.0,
-            "bounce_away":     -50.0,
-        }
-        self.weights = {**_default_weights, **(weights or {})}
+        # Precomputed zone radii
+        self._outer_r   = rim_radius_px * self.OUTER_SCALE
+        self._halo_r    = rim_radius_px * self.HALO_SCALE
+        self._scoring_r = rim_radius_px * self.SCORING_SCALE
+        self._net_r     = int(rim_radius_px * self.NET_ROI_SCALE)
 
-        # Per-attempt tracking state
-        self.frame_idx = 0
-        self.attempt_id = 0
-        self.current: Optional[ShotAttempt] = None
-        self.recent_positions: List[Tuple[int, int]] = []
-        self.inside_rim_frames = 0
-        self.net_lane_frames = 0
-        self.seen_above_rim = False
-        self.last_ball_center: Optional[Tuple[int, int]] = None
-        self.last_scored_frame = -10_000
-
-        # Confidence scoring state (reset per attempt)
-        self._signals: Dict[str, float] = {}
-        self._max_net_flow: float = 0.0
-        self._tracking_frames_since_launch: int = 0
-        self._travel_px_since_launch: float = 0.0
-        self._consecutive_outside: int = 0
-
-        # Frame-level state (persists across attempts for optical flow)
+        # Persistent across resets
+        self._frame_idx            = 0
         self._prev_gray: Optional[np.ndarray] = None
+        self._diff_buf: Deque[float]           = deque(maxlen=10)
+        self._last_approach_frame: int         = -10_000
+        self.attempt_id                        = 0
 
-        # Net ROI bounding box derived from rim geometry
-        rx, ry = rim_center
-        lane_half = int(rim_radius_px * net_lane_radius_scale)
-        self._net_roi: Tuple[int, int, int, int] = (
-            rx - lane_half,
-            ry + net_drop_margin_px,
-            rx + lane_half,
-            ry + rim_radius_px * 2,
-        )
+        self.current: Optional[ShotAttempt]   = None
+        self._reset()
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+    # ─── Public API ───────────────────────────────────────────────────────────
+
+    @property
+    def frame_idx(self) -> int:
+        return self._frame_idx
 
     def update(
         self,
         ball_center: Optional[Tuple[int, int]],
         frame: Optional[np.ndarray] = None,
     ) -> Optional[ShotAttempt]:
-        """
-        Call once per frame.
+        """Call once per frame. Returns ShotAttempt when a shot resolves."""
+        self._frame_idx += 1
 
-        Args:
-            ball_center: tracked ball pixel position, or None if not detected.
-            frame:       current BGR frame (optional). Required for optical flow
-                         signal; safe to omit when optical flow is not needed.
+        # Always compute net-ROI pixel diff (enables fallback even with no ball)
+        net_diff = self._compute_net_diff(frame)
+        self._diff_buf.append(net_diff)
+        spike = self._diff_spike()
 
-        Returns a completed ShotAttempt when a shot resolves, otherwise None.
-        """
-        self.frame_idx += 1
+        dist = self._dist(ball_center)
 
-        if frame is not None and self.current is not None:
-            self._update_net_flow(frame)
+        # Update approach memory whenever ball is seen outside the halo
+        if ball_center is not None and dist is not None:
+            if self._halo_r < dist < self._outer_r:
+                self._last_approach_frame = self._frame_idx
 
-        outcome = self._step(ball_center)
+        outcome = self._dispatch(ball_center, dist, spike)
+
+        # Fallback: net-diff-only make detection (YOLO completely dead)
+        if outcome is None and self._phase == _Phase.IDLE:
+            frames_since_approach = self._frame_idx - self._last_approach_frame
+            if (frames_since_approach < self.APPROACH_MEMORY_FRAMES
+                    and net_diff >= self.NET_DIFF_THRESHOLD * self.FALLBACK_DIFF_MULTIPLIER):
+                outcome = self._register("make")
 
         if frame is not None:
             self._prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -152,257 +197,357 @@ class ShotLogic:
         return outcome
 
     def debug_state(self) -> Dict:
-        rx, ry = self.rim_center
-        lane_half = int(self.rim_radius_px * self.net_lane_radius_scale)
+        last_diff = self._diff_buf[-1] if self._diff_buf else 0.0
         return {
-            "rim_center": (rx, ry),
-            "scoring_radius": int(self.rim_radius_px * 1.1),
-            "entry_line_y": int(ry - self.entry_above_margin_px),
-            "net_line_y": int(ry + self.net_drop_margin_px),
-            "net_lane_x_left": int(rx - lane_half),
-            "net_lane_x_right": int(rx + lane_half),
-            "inside_rim_frames": self.inside_rim_frames,
-            "net_lane_frames": self.net_lane_frames,
-            "seen_above_rim": self.seen_above_rim,
+            # Geometry (for overlay drawing)
+            "rim_center":       self.rim_center,
+            "scoring_radius":   int(self._scoring_r),
+            "halo_radius":      int(self._halo_r),
+            "net_roi_radius":   self._net_r,
+            # Phase / signal state
+            "phase":            self._phase.value,
+            "net_diff":         round(last_diff, 1),
+            "diff_spike":       self._diff_spike(),
+            "approach_frames":  len(self._approach_dists),
+            "absent_scoring":   self._absent_scoring,
+            "flow_confirm":     self._flow_confirm,
             "has_active_attempt": self.current is not None,
-            "attempt_id": None if self.current is None else self.current.id,
-            "confidence_score": round(sum(self._signals.values()), 1),
-            "signals": dict(self._signals),
-            "max_net_flow": round(self._max_net_flow, 3),
+            "attempt_id":       self.current.id if self.current else None,
+            # Legacy keys expected by draw_debug_overlay in main.py
+            "entry_line_y":        self.rim_center[1],
+            "net_line_y":          self.rim_center[1],
+            "net_lane_x_left":     self.rim_center[0] - self._net_r,
+            "net_lane_x_right":    self.rim_center[0] + self._net_r,
+            "inside_rim_frames":   self._absent_scoring,
+            "net_lane_frames":     self._flow_confirm,
+            "seen_above_rim":      False,
+            "confidence_score":    round(last_diff, 1),
+            "signals":             {"phase": self._phase.value, "net_diff": round(last_diff, 1)},
+            "max_net_flow":        round(max(self._diff_buf, default=0), 1),
         }
 
-    # ------------------------------------------------------------------
-    # Core step logic
-    # ------------------------------------------------------------------
+    # ─── Phase dispatch ───────────────────────────────────────────────────────
 
-    def _step(self, ball_center: Optional[Tuple[int, int]]) -> Optional[ShotAttempt]:
-        if ball_center is None:
-            return self._handle_no_detection()
-
-        self.recent_positions.append(ball_center)
-        if len(self.recent_positions) > 30:
-            self.recent_positions = self.recent_positions[-30:]
-
-        if self.current is None:
-            self._try_start_attempt(ball_center)
-            self.last_ball_center = ball_center
-            return None
-
-        return self._update_active_attempt(ball_center)
-
-    def _handle_no_detection(self) -> Optional[ShotAttempt]:
-        if self.current is None:
-            self.last_ball_center = None
-            return None
-
-        elapsed = self.frame_idx - self.current.start_frame
-        if elapsed > self.miss_timeout_frames:
-            return self._close_attempt("miss")
-
-        self.last_ball_center = None
+    def _dispatch(
+        self,
+        ball_center: Optional[Tuple[int, int]],
+        dist: Optional[float],
+        spike: bool,
+    ) -> Optional[ShotAttempt]:
+        if self._phase == _Phase.IDLE:
+            return self._idle(ball_center, dist)
+        if self._phase == _Phase.APPROACH:
+            return self._approach(ball_center, dist, spike)
+        if self._phase == _Phase.COMMITTED:
+            return self._committed(ball_center, dist, spike)
+        if self._phase == _Phase.WAIT_OUT:
+            return self._wait_out(ball_center, dist, spike)
+        if self._phase == _Phase.COOLDOWN:
+            if self._frame_idx - self._phase_start >= self.COOLDOWN_FRAMES:
+                self._reset()
         return None
 
-    def _try_start_attempt(self, ball_center: Tuple[int, int]) -> None:
-        if self.frame_idx - self.last_scored_frame < self.score_cooldown_frames:
-            return
-        if len(self.recent_positions) < 6:
-            return
+    # ── IDLE ─────────────────────────────────────────────────────────────────
 
-        positions = self.recent_positions[-6:]
-        ys = [p[1] for p in positions]
-        arc_drop = ys[-1] - min(ys)
+    def _idle(
+        self,
+        ball_center: Optional[Tuple[int, int]],
+        dist: Optional[float],
+    ) -> Optional[ShotAttempt]:
+        if ball_center is None or dist is None:
+            return None
+        # Ball must be in the outer shot zone but outside the committed zone
+        if not (self._halo_r < dist < self._outer_r):
+            return None
+        # Must have a velocity component toward the rim
+        if not self._moving_toward_rim(ball_center):
+            return None
 
-        # Velocity gate: reject slow/stationary tracks (e.g. rim false positives)
-        if self.min_launch_velocity_px > 0:
-            vels = [
-                ((positions[i][0] - positions[i - 1][0]) ** 2
-                 + (positions[i][1] - positions[i - 1][1]) ** 2) ** 0.5
-                for i in range(1, len(positions))
-            ]
-            if sum(vels) / len(vels) < self.min_launch_velocity_px:
-                return
+        # Transition → APPROACH
+        self.attempt_id += 1
+        self.current = ShotAttempt(
+            id=self.attempt_id,
+            start_frame=self._frame_idx,
+            start_px=ball_center,
+        )
+        self._approach_dists = [dist]
+        self._approach_pos   = [ball_center]
+        self._phase          = _Phase.APPROACH
+        self._phase_start    = self._frame_idx
+        self._dropout_frames = 0
+        return None
 
-        # Ball must be moving toward the rim (filters dribbles which stay in place)
-        dists = [self._distance_to_rim(p) for p in positions]
-        approaching = dists[-1] < dists[0] - 20
+    # ── APPROACH ─────────────────────────────────────────────────────────────
 
-        if self._is_in_launch_region(ball_center) and arc_drop > self.min_shot_arc_drop_px and approaching:
+    def _approach(
+        self,
+        ball_center: Optional[Tuple[int, int]],
+        dist: Optional[float],
+        spike: bool,
+    ) -> Optional[ShotAttempt]:
+        elapsed = self._frame_idx - self._phase_start
+
+        if ball_center is not None and dist is not None:
+            self._dropout_frames = 0
+            self._approach_dists.append(dist)
+            self._approach_pos.append(ball_center)
+            self._last_approach_frame = self._frame_idx
+
+            # ── Entered halo → COMMITTED ──────────────────────────────────────
+            if dist < self._halo_r:
+                self._phase         = _Phase.COMMITTED
+                self._phase_start   = self._frame_idx
+                self._committed_abs = 0
+                self._recent_dists  = deque(maxlen=self.REVERSAL_WINDOW)
+                return None
+
+            # ── Ball fled the shot zone → cancel ──────────────────────────────
+            if dist > self._outer_r:
+                self._reset()
+                return None
+
+            # ── Anti-dribble / anti-pass: verify sustained approach ───────────
+            # Only check after enough history so we don't cancel too eagerly.
+            if len(self._approach_dists) > 15 and not self._sustained_approach():
+                self._reset()
+                return None
+
+        else:
+            # Tracking dropout — allow a brief gap, then cancel
+            self._dropout_frames += 1
+            if self._approach_dists:
+                self._approach_dists.append(self._approach_dists[-1])  # hold last dist
+            if self._dropout_frames > self.MAX_APPROACH_DROPOUT:
+                self._reset()
+                return None
+
+        # Net diff spike during approach (ball very close, slipped through fast) → make
+        if spike:
+            return self._register("make")
+
+        if elapsed > self.APPROACH_TIMEOUT:
+            self._reset()
+        return None
+
+    # ── COMMITTED ────────────────────────────────────────────────────────────
+
+    def _committed(
+        self,
+        ball_center: Optional[Tuple[int, int]],
+        dist: Optional[float],
+        spike: bool,
+    ) -> Optional[ShotAttempt]:
+        elapsed = self._frame_idx - self._phase_start
+
+        if ball_center is not None and dist is not None:
+            self._recent_dists.append(dist)
+            self._committed_abs = 0
+
+            # ── Entered scoring zone → WAIT_OUT ───────────────────────────────
+            if dist < self._scoring_r:
+                self._phase          = _Phase.WAIT_OUT
+                self._phase_start    = self._frame_idx
+                self._absent_scoring = 0
+                self._flow_confirm   = 0
+                return None
+
+            # ── Ball reversed sharply away from rim → MISS ────────────────────
+            # Only call a miss if the ball is clearly outside the halo again AND
+            # the recent trajectory is consistently diverging.
+            if dist > self._halo_r * 1.3 and self._reversed():
+                return self._register("miss")
+
+        else:
+            # Ball vanished inside the halo zone
+            self._committed_abs += 1
+            # If net also spiked, very likely a make (ball fell through quickly)
+            if spike and self._committed_abs >= 2:
+                return self._register("make")
+
+        # Net diff spike while tracking → ball passed through scoring zone fast
+        if spike:
+            return self._register("make")
+
+        if elapsed > self.COMMITTED_TIMEOUT:
+            return self._register("miss")
+        return None
+
+    # ── WAIT_OUT ─────────────────────────────────────────────────────────────
+
+    def _wait_out(
+        self,
+        ball_center: Optional[Tuple[int, int]],
+        dist: Optional[float],
+        spike: bool,
+    ) -> Optional[ShotAttempt]:
+        """Ball entered the rim interior. Confirm make or miss."""
+        elapsed = self._frame_idx - self._phase_start
+
+        if ball_center is not None and dist is not None:
+            if dist > self._halo_r:
+                # Ball reappeared well outside the rim — bounced back out → MISS
+                return self._register("miss")
+            if dist < self._scoring_r:
+                self._absent_scoring = 0   # still tracked inside scoring zone
+            else:
+                self._absent_scoring += 1  # in halo but not in scoring center
+        else:
+            # Lost tracking — most likely the ball fell through the net
+            self._absent_scoring += 1
+
+        # Net pixel-diff spike = ball deforming the net
+        if spike:
+            self._flow_confirm += 1
+            if self._flow_confirm >= self.NET_DIFF_SPIKE_HOLD:
+                return self._register("make")
+        else:
+            self._flow_confirm = 0
+
+        # Ball disappeared from scoring zone for N consecutive frames → MAKE
+        # (ball fell below the rim plane into the net)
+        if self._absent_scoring >= self.DISAPPEAR_FRAMES:
+            return self._register("make")
+
+        if elapsed > self.WAIT_OUT_TIMEOUT:
+            return self._register("miss")
+        return None
+
+    # ─── Geometry helpers ─────────────────────────────────────────────────────
+
+    def _dist(self, p: Optional[Tuple[int, int]]) -> Optional[float]:
+        if p is None:
+            return None
+        rx, ry = self.rim_center
+        return math.hypot(p[0] - rx, p[1] - ry)
+
+    def _moving_toward_rim(self, ball_center: Tuple[int, int]) -> bool:
+        """
+        Returns True if the ball is moving toward the rim.
+        Requires at least one prior approach position; if not, optimistically
+        returns True (we'll verify via _sustained_approach later).
+        """
+        if not self._approach_pos:
+            return True
+        prev = self._approach_pos[-1]
+        rx, ry = self.rim_center
+        dx, dy = rx - prev[0], ry - prev[1]   # direction to rim
+        mx, my = ball_center[0] - prev[0], ball_center[1] - prev[1]  # motion
+        norm = math.hypot(dx, dy) or 1.0
+        dot = (mx * dx + my * dy) / norm
+        # Lenient: allow slightly sideways motion (corner shots etc.)
+        return dot > -3.0
+
+    def _sustained_approach(self) -> bool:
+        """
+        True if the recent approach history shows a sustained, consistent
+        convergence toward the rim — not a dribble or random motion.
+        """
+        dists = self._approach_dists[-15:]
+        if len(dists) < self.MIN_APPROACH_FRAMES:
+            return True  # not enough history yet, give benefit of doubt
+        converging = sum(
+            1 for i in range(1, len(dists)) if dists[i] < dists[i - 1]
+        )
+        ratio     = converging / (len(dists) - 1)
+        net_closed = dists[0] - dists[-1]
+        return ratio >= self.CONVERGE_RATIO and net_closed >= self.MIN_DISTANCE_CLOSED
+
+    def _reversed(self) -> bool:
+        """True if recent distance trend is consistently moving AWAY from rim."""
+        dists = list(self._recent_dists)
+        if len(dists) < 4:
+            return False
+        diverging = sum(
+            1 for i in range(1, len(dists)) if dists[i] > dists[i - 1]
+        )
+        return diverging / (len(dists) - 1) >= self.REVERSAL_RATIO
+
+    # ─── Net-ROI pixel diff ───────────────────────────────────────────────────
+
+    def _compute_net_diff(self, frame: Optional[np.ndarray]) -> float:
+        """
+        Mean absolute pixel change inside the net interior circle.
+
+        We use frame-difference (absdiff) rather than Farneback optical flow:
+          - Much faster on Jetson
+          - Sufficient to detect the large pixel change caused by a ball
+            passing through the white net
+          - Baseline (stationary net) ≈ 2–5; ball through net ≈ 10–30+
+        """
+        if frame is None or self._prev_gray is None:
+            return 0.0
+
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        rx, ry = self.rim_center
+        nr = self._net_r
+        x1 = max(0, rx - nr)
+        y1 = max(0, ry - nr)
+        x2 = min(w, rx + nr)
+        y2 = min(h, ry + nr)
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        crop_cur = gray[y1:y2, x1:x2]
+        crop_prv = self._prev_gray[y1:y2, x1:x2]
+
+        diff = cv2.absdiff(crop_cur, crop_prv).astype(np.float32)
+
+        # Mask to inscribed circle only (exclude corners of the bounding box)
+        cy_off = ry - y1   # rim center in crop coords
+        cx_off = rx - x1
+        Y, X   = np.ogrid[:diff.shape[0], :diff.shape[1]]
+        circle_mask = (X - cx_off) ** 2 + (Y - cy_off) ** 2 <= nr ** 2
+        in_circle = diff[circle_mask]
+        if in_circle.size == 0:
+            return 0.0
+        return float(np.mean(in_circle))
+
+    def _diff_spike(self) -> bool:
+        if not self._diff_buf:
+            return False
+        return self._diff_buf[-1] >= self.NET_DIFF_THRESHOLD
+
+    # ─── Outcome registration ─────────────────────────────────────────────────
+
+    def _register(self, result: str) -> ShotAttempt:
+        """Finalise the current attempt and transition to COOLDOWN."""
+        if self.current is None:
+            # Fallback path: no attempt object was created (YOLO-dead make)
             self.attempt_id += 1
             self.current = ShotAttempt(
                 id=self.attempt_id,
-                start_frame=self.frame_idx,
-                start_px=self.recent_positions[-6],
+                start_frame=self._frame_idx,
+                start_px=self.rim_center,
             )
-            self._reset_attempt_state()
-
-    def _update_active_attempt(self, ball_center: Tuple[int, int]) -> Optional[ShotAttempt]:
-        # Track per-attempt travel for gate condition
-        if self.last_ball_center is not None:
-            dx = ball_center[0] - self.last_ball_center[0]
-            dy = ball_center[1] - self.last_ball_center[1]
-            self._travel_px_since_launch += (dx * dx + dy * dy) ** 0.5
-        self._tracking_frames_since_launch += 1
-
-        # Above-rim check
-        if self._is_above_rim(ball_center):
-            self.seen_above_rim = True
-
-        # Scoring zone (rim proximity)
-        if self._is_in_scoring_zone(ball_center):
-            self.inside_rim_frames += 1
-        else:
-            self.inside_rim_frames = 0
-
-        # Net lane: ball must be moving downward through lane
-        downward = (
-            self.last_ball_center is not None
-            and ball_center[1] > self.last_ball_center[1]
-        )
-        if self._is_in_net_lane(ball_center) and downward:
-            self.net_lane_frames += 1
-        else:
-            self.net_lane_frames = 0
-
-        is_make = self._evaluate_make(ball_center)
-
-        if is_make:
-            return self._close_attempt("make")
-
-        if self.frame_idx - self.current.start_frame > self.miss_timeout_frames:
-            return self._close_attempt("miss")
-
-        self.last_ball_center = ball_center
-        return None
-
-    # ------------------------------------------------------------------
-    # Make evaluation
-    # ------------------------------------------------------------------
-
-    def _evaluate_make(self, ball_center: Tuple[int, int]) -> bool:
-        if self.use_confidence_scoring:
-            return self._confidence_is_make(ball_center)
-        return self._legacy_is_make()
-
-    def _legacy_is_make(self) -> bool:
-        return (
-            self.seen_above_rim
-            and self.inside_rim_frames >= self.make_confirm_frames
-            and self.net_lane_frames >= self.net_confirm_frames
-        )
-
-    def _confidence_is_make(self, ball_center: Tuple[int, int]) -> bool:
-        # Gate: discard if trajectory too short (filters loose balls)
-        if (
-            self._tracking_frames_since_launch < self.min_tracking_frames
-            or self._travel_px_since_launch < self.min_travel_px
-        ):
-            return False
-
-        # --- Positive signals ---
-        if self.seen_above_rim:
-            self._signals["above_rim_entry"] = self.weights["above_rim_entry"]
-
-        if self.inside_rim_frames >= self.make_confirm_frames:
-            self._signals["inside_rim_zone"] = self.weights["inside_rim_zone"]
-
-        if self.net_lane_frames >= self.net_confirm_frames:
-            self._signals["net_lane_passage"] = self.weights["net_lane_passage"]
-
-        if self._max_net_flow >= self.net_flow_threshold:
-            self._signals["net_optical_flow"] = self.weights["net_optical_flow"]
-
-        # --- Negative signal: ball moving away from rim ---
-        if (
-            self.last_ball_center is not None
-            and not self._is_in_scoring_zone(ball_center)
-        ):
-            prev_dist = self._distance_to_rim(self.last_ball_center)
-            curr_dist = self._distance_to_rim(ball_center)
-            if curr_dist > prev_dist + 5:
-                self._consecutive_outside += 1
-                if self._consecutive_outside >= 3:
-                    self._signals["bounce_away"] = self.weights["bounce_away"]
-            else:
-                self._consecutive_outside = 0
-
-        return sum(self._signals.values()) >= self.make_threshold
-
-    # ------------------------------------------------------------------
-    # Attempt resolution
-    # ------------------------------------------------------------------
-
-    def _close_attempt(self, result: str) -> ShotAttempt:
-        assert self.current is not None
-        self.current.result = result
-        self.current.end_frame = self.frame_idx
-        self.current.confidence = round(sum(self._signals.values()), 1)
-        self.current.signal_breakdown = dict(self._signals)
-        done = self.current
+        self.current.result    = result
+        self.current.end_frame = self._frame_idx
+        peak_diff = round(max(self._diff_buf, default=0.0), 1)
+        self.current.confidence = peak_diff
+        self.current.signal_breakdown = {
+            "phase_at_outcome": self._phase.value,
+            "peak_net_diff":    peak_diff,
+            "approach_frames":  len(self._approach_dists),
+            "absent_scoring":   self._absent_scoring,
+        }
+        done         = self.current
         self.current = None
-        self.last_scored_frame = self.frame_idx
-        self._reset_attempt_state()
-        self.last_ball_center = None
+        self._phase  = _Phase.COOLDOWN
+        self._phase_start = self._frame_idx
         return done
 
-    # ------------------------------------------------------------------
-    # Geometry helpers
-    # ------------------------------------------------------------------
+    # ─── Internal reset ───────────────────────────────────────────────────────
 
-    def _distance_to_rim(self, p: Tuple[int, int]) -> float:
-        rx, ry = self.rim_center
-        return ((p[0] - rx) ** 2 + (p[1] - ry) ** 2) ** 0.5
-
-    def _is_in_launch_region(self, p: Tuple[int, int]) -> bool:
-        return self._distance_to_rim(p) > self.rim_radius_px * self.launch_region_scale
-
-    def _is_in_scoring_zone(self, p: Tuple[int, int]) -> bool:
-        return self._distance_to_rim(p) <= self.rim_radius_px * 1.1
-
-    def _is_above_rim(self, p: Tuple[int, int]) -> bool:
-        _, ry = self.rim_center
-        return p[1] <= ry - self.entry_above_margin_px
-
-    def _is_in_net_lane(self, p: Tuple[int, int]) -> bool:
-        rx, ry = self.rim_center
-        lane_half = self.rim_radius_px * self.net_lane_radius_scale
-        return abs(p[0] - rx) <= lane_half and p[1] >= ry + self.net_drop_margin_px
-
-    # ------------------------------------------------------------------
-    # Optical flow
-    # ------------------------------------------------------------------
-
-    def _update_net_flow(self, frame: np.ndarray) -> None:
-        if self._prev_gray is None:
-            return
-        x1, y1, x2, y2 = self._net_roi
-        h, w = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w - 1, x2), min(h - 1, y2)
-        if x2 <= x1 or y2 <= y1:
-            return
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        roi_curr = gray[y1:y2, x1:x2]
-        roi_prev = self._prev_gray[y1:y2, x1:x2]
-        if roi_curr.size == 0 or roi_prev.size == 0:
-            return
-        flow = cv2.calcOpticalFlowFarneback(
-            roi_prev, roi_curr, None,
-            pyr_scale=0.5, levels=3, winsize=15,
-            iterations=3, poly_n=5, poly_sigma=1.2, flags=0,
-        )
-        mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
-        self._max_net_flow = max(self._max_net_flow, float(np.mean(mag)))
-
-    # ------------------------------------------------------------------
-    # Reset
-    # ------------------------------------------------------------------
-
-    def _reset_attempt_state(self) -> None:
-        self.inside_rim_frames = 0
-        self.net_lane_frames = 0
-        self.seen_above_rim = False
-        self._signals = {}
-        self._max_net_flow = 0.0
-        self._tracking_frames_since_launch = 0
-        self._travel_px_since_launch = 0.0
-        self._consecutive_outside = 0
+    def _reset(self) -> None:
+        """Reset per-attempt state. Does NOT reset frame_idx, flow buf, or session totals."""
+        self._phase           = _Phase.IDLE
+        self._phase_start     = -1
+        self.current          = None
+        self._approach_dists: List[float]            = []
+        self._approach_pos:   List[Tuple[int, int]]  = []
+        self._recent_dists:   Deque[float]           = deque(maxlen=self.REVERSAL_WINDOW)
+        self._committed_abs   = 0
+        self._absent_scoring  = 0
+        self._flow_confirm    = 0
+        self._dropout_frames  = 0
