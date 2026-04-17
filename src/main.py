@@ -328,8 +328,9 @@ def main() -> None:
 
         track = tracker.update(detections)
         center = track.center if track is not None else None
+        radius = track.radius if track is not None else None
 
-        done = shot_logic.update(center, frame)
+        done = shot_logic.update(center, frame, ball_radius=radius)
 
         # Capture foot position at the moment an attempt is triggered
         has_attempt = shot_logic.current is not None

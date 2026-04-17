@@ -129,6 +129,33 @@ class ShotLogic:
     APPROACH_MEMORY_FRAMES   = 90   # frames we remember "approach was active"
     FALLBACK_DIFF_MULTIPLIER = 1.4  # fallback needs higher diff to avoid false pos
 
+    # ── Ball-size trend (bounce-up miss detection) ────────────────────────────
+    # While the ball is inside the scoring zone we record its detected radius
+    # each frame. When the ball disappears we check whether it was growing
+    # (bounced straight up toward the camera → miss candidate).
+    #
+    # NOTE: we do NOT treat "shrinking" as a make signal. A ball on a normal
+    # shot arc is already shrinking on its descent as it enters the rim, so
+    # shrinking is indistinguishable from a miss that clips the front of the
+    # rim. Only a growing ball is a meaningful signal (bounce-up miss).
+    # Shrinking/unknown both fall through to the net-diff + disappearance path.
+    SIZE_HISTORY_FRAMES  = 8    # rolling window of radius samples
+    MIN_SIZE_SAMPLES     = 4    # need at least this many samples to trust trend
+    GROW_DELTA_PX        = 2    # avg radius must grow by this much px to call "growing"
+
+    # ── Bounce-up patience ────────────────────────────────────────────────────
+    # When we detect a bounce-up (growing ball disappears from scoring zone)
+    # we don't immediately call a miss. We wait this many frames to see if the
+    # ball comes back down through the basket (rare but real). If it re-enters
+    # the scoring zone during this window we resume watching normally.
+    BOUNCE_UP_PATIENCE   = 15
+
+    # ── Rim-rattle extended timeout ───────────────────────────────────────────
+    # A ball rolling around the rim stays visible in the scoring zone for many
+    # frames. The normal WAIT_OUT_TIMEOUT would call a premature miss. We allow
+    # a longer window while the ball is actively visible inside the scoring zone.
+    RATTLE_TIMEOUT       = 90   # hard cap even for active rim rattles (~1.5 s @ 60 fps)
+
     def __init__(
         self,
         rim_center: Tuple[int, int],
@@ -170,6 +197,7 @@ class ShotLogic:
         self,
         ball_center: Optional[Tuple[int, int]],
         frame: Optional[np.ndarray] = None,
+        ball_radius: Optional[int] = None,
     ) -> Optional[ShotAttempt]:
         """Call once per frame. Returns ShotAttempt when a shot resolves."""
         self._frame_idx += 1
@@ -186,7 +214,7 @@ class ShotLogic:
             if self._halo_r < dist < self._outer_r:
                 self._last_approach_frame = self._frame_idx
 
-        outcome = self._dispatch(ball_center, dist, spike)
+        outcome = self._dispatch(ball_center, dist, spike, ball_radius)
 
         # Fallback: net-diff-only make detection (YOLO completely dead)
         if outcome is None and self._phase == _Phase.IDLE:
@@ -214,6 +242,7 @@ class ShotLogic:
             "diff_spike":       self._diff_spike(),
             "approach_frames":  len(self._approach_dists),
             "absent_scoring":   self._absent_scoring,
+            "bounce_up_watch":  self._bounce_up_watch,
             "flow_confirm":     self._flow_confirm,
             "has_active_attempt": self.current is not None,
             "attempt_id":       self.current.id if self.current else None,
@@ -237,6 +266,7 @@ class ShotLogic:
         ball_center: Optional[Tuple[int, int]],
         dist: Optional[float],
         spike: bool,
+        ball_radius: Optional[int] = None,
     ) -> Optional[ShotAttempt]:
         if self._phase == _Phase.IDLE:
             return self._idle(ball_center, dist)
@@ -247,7 +277,7 @@ class ShotLogic:
         if self._phase == _Phase.COMMITTED:
             return self._committed(ball_center, dist, spike)
         if self._phase == _Phase.WAIT_OUT:
-            return self._wait_out(ball_center, dist, spike)
+            return self._wait_out(ball_center, dist, spike, ball_radius)
         if self._phase == _Phase.COOLDOWN:
             if self._frame_idx - self._phase_start >= self.COOLDOWN_FRAMES:
                 self._reset()
@@ -381,6 +411,7 @@ class ShotLogic:
                 self._absent_retreating    = 0
                 self._last_in_scoring      = True
                 self._flow_confirm         = 0
+                self._scoring_radii.clear()
                 return None
 
             # Ball exited halo entirely — not a shot, reset silently
@@ -415,6 +446,7 @@ class ShotLogic:
                 self._absent_retreating = 0
                 self._last_in_scoring   = True
                 self._flow_confirm      = 0
+                self._scoring_radii.clear()
                 return None
 
             # ── Ball reversed sharply away from rim → MISS ────────────────────
@@ -445,19 +477,26 @@ class ShotLogic:
         ball_center: Optional[Tuple[int, int]],
         dist: Optional[float],
         spike: bool,
+        ball_radius: Optional[int] = None,
     ) -> Optional[ShotAttempt]:
         """
         Ball entered the rim interior. Confirm make or miss.
 
-        The core distinction:
-          MAKE — ball was last seen inside the scoring zone and then disappears
-                 (it fell below the rim plane into the net, camera loses it)
-          MISS — ball retreats to the halo zone and then disappears
-                 (bounced upward/sideways out of the frame, never went through)
+        Outcome cases handled:
+          MAKE           — ball disappears from scoring zone (absent_scoring hits
+                           DISAPPEAR_FRAMES) or net-diff spike while absent.
+          BOUNCE-OUT     — ball retreats to halo zone and disappears
+                           (hit rim edge and bounced sideways).
+          BOUNCE-UP      — ball was growing while in scoring zone, then vanishes.
+                           We wait BOUNCE_UP_PATIENCE frames before calling miss
+                           so a ball that bounces up and comes back in is caught.
+          RIM-RATTLE     — ball stays visible in scoring zone for many frames.
+                           Normal WAIT_OUT_TIMEOUT is suspended while the ball is
+                           actively visible; RATTLE_TIMEOUT is the hard cap.
 
-        We track _last_in_scoring to know which case applies when the ball
-        goes absent, so a ball bouncing straight up out of frame is not
-        mistaken for a make.
+        _last_in_scoring: True when ball was last seen inside the scoring zone.
+        _scoring_radii:   radius history while ball is inside scoring zone.
+        _bounce_up_watch: frames elapsed since a growing-ball disappearance.
         """
         elapsed = self._frame_idx - self._phase_start
 
@@ -467,22 +506,36 @@ class ShotLogic:
                 return self._register("miss")
 
             if dist < self._scoring_r:
-                # Ball still inside scoring zone
+                # Ball still inside / back inside scoring zone.
+                # If we were in a bounce-up watch window, the ball came back
+                # down — reset and keep watching normally.
                 self._last_in_scoring    = True
                 self._absent_scoring     = 0
                 self._absent_retreating  = 0
+                self._bounce_up_watch    = 0
+                if ball_radius is not None:
+                    self._scoring_radii.append(ball_radius)
             else:
                 # Ball in halo but outside scoring zone — retreating
                 self._last_in_scoring    = False
                 self._absent_retreating += 1
 
         else:
-            # Ball absent — direction at disappearance determines outcome
+            # Ball absent
             if self._last_in_scoring:
-                # Disappeared from inside scoring zone → fell through net → MAKE candidate
-                self._absent_scoring += 1
+                if self._size_trend() == "growing":
+                    # Possible bounce-up. Don't call miss immediately — wait
+                    # BOUNCE_UP_PATIENCE frames to see if ball comes back in.
+                    self._bounce_up_watch += 1
+                    if self._bounce_up_watch >= self.BOUNCE_UP_PATIENCE:
+                        return self._register("miss")
+                else:
+                    # Shrinking or unknown: ball fell through net or we don't
+                    # have enough data. Either way treat as make candidate and
+                    # let the net-diff + DISAPPEAR_FRAMES path decide.
+                    self._absent_scoring += 1
             else:
-                # Disappeared while retreating (in halo) → bounced away → MISS
+                # Disappeared while retreating → bounced away → MISS
                 self._absent_retreating += 1
                 if self._absent_retreating >= self.RETREATING_MISS_FRAMES:
                     return self._register("miss")
@@ -501,8 +554,22 @@ class ShotLogic:
         if self._absent_scoring >= self.DISAPPEAR_FRAMES:
             return self._register("make")
 
-        if elapsed > self.WAIT_OUT_TIMEOUT:
-            return self._register("miss")
+        # Timeout logic:
+        #   — While ball is actively visible inside the scoring zone (rim rattle)
+        #     suppress the normal timeout and use the longer RATTLE_TIMEOUT.
+        #   — Otherwise apply the standard WAIT_OUT_TIMEOUT.
+        ball_active_in_zone = (
+            self._last_in_scoring
+            and self._absent_scoring == 0
+            and self._bounce_up_watch == 0
+        )
+        if ball_active_in_zone:
+            if elapsed > self.RATTLE_TIMEOUT:
+                return self._register("miss")
+        else:
+            if elapsed > self.WAIT_OUT_TIMEOUT:
+                return self._register("miss")
+
         return None
 
     # ─── Geometry helpers ─────────────────────────────────────────────────────
@@ -554,6 +621,30 @@ class ShotLogic:
             1 for i in range(1, len(dists)) if dists[i] > dists[i - 1]
         )
         return diverging / (len(dists) - 1) >= self.REVERSAL_RATIO
+
+    # ─── Ball size trend ──────────────────────────────────────────────────────
+
+    def _size_trend(self) -> str:
+        """
+        Detect whether the ball was growing while inside the scoring zone.
+
+        Returns 'growing' or 'unknown'.
+
+        Only growing is actionable: a ball moving toward the camera (getting
+        bigger) bounced upward and is a miss candidate. We deliberately do NOT
+        classify 'shrinking' as a make signal — a ball on a normal shot arc is
+        already shrinking on descent into the rim, so shrinking is present on
+        both makes and rim-clips. Only a clear, sustained growth is meaningful.
+        """
+        radii = list(self._scoring_radii)
+        if len(radii) < self.MIN_SIZE_SAMPLES:
+            return "unknown"
+        mid = len(radii) // 2
+        avg_early = sum(radii[:mid]) / mid
+        avg_late  = sum(radii[mid:]) / (len(radii) - mid)
+        if avg_late - avg_early >= self.GROW_DELTA_PX:
+            return "growing"
+        return "unknown"
 
     # ─── Net-ROI pixel diff ───────────────────────────────────────────────────
 
@@ -648,3 +739,5 @@ class ShotLogic:
         self._watching_pos: Optional[Tuple[int, int]] = None
         self._last_in_scoring     = False
         self._absent_retreating   = 0
+        self._bounce_up_watch     = 0
+        self._scoring_radii: Deque[int] = deque(maxlen=self.SIZE_HISTORY_FRAMES)
